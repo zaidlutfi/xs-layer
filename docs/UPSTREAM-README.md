@@ -28,10 +28,12 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-25)
+## Status of this fork (2026-11-25, late)
 
-**Not playable yet: about 8 to 10 frames per second in the first rooms and 5 to 8.5 in the
-opening cutscene (the console runs 30), and shadowed areas are black.**
+**Playable for half an hour at a time, slowly: about 9 to 12 frames per second (the console runs
+30). The tester has played from the opening through the prologue and past the first boat mission.
+Then the graphics card is lost (three times in sessions of 6, 49 and 31 minutes; cause not known
+yet). Shadowed areas are still black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 32 GB RAM. The Series X profile is used throughout.
 
@@ -39,13 +41,78 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 |-------|--------------------|
 | Boot, menus, start screen | works, 30 fps (as upstream) |
 | Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
-| Saves | the game autosaves a checkpoint and loads it again |
-| First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
+| Saves | the game autosaves a checkpoint and loads it again; test runs continue from the last checkpoint |
+| The prologue and the first missions | play: characters, textures, sky, sunlit exteriors, vehicles and boats; HUD, pause menu and pad input work. Played past the first boat mission (2026-11-25) |
+| Water | right since `VICTORY_TEXTURE_BACK=1` (pull request #999): boats float, the surface is lit (blue, waves, the sun's path). Without it boats sink and the mission fails |
 | Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 8 to 10 fps in the first rooms: 97 to 104 ms a frame at about 3,850 draws, 122 ms in a heavier view (6,774 draws). 5 to 8.5 fps through the opening cutscene, by stretch (runs 271 to 273, with `VICTORY_CARD_WINDOWS_MB`). All measured with the switch set of run 253, which is off by default: `VICTORY_LEVELS_ON_DEMAND=1 VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096 VICTORY_STAGING_POOL=0 VICTORY_COPY_PLAIN=1 VICTORY_JOIN_PARTS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1 VICTORY_CARD_REHASH_RUNS=1`. The plain defaults were last measured at 420 to 450 ms a frame and not since. It started at 3 to 6 seconds a frame |
-| Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
+| Frame rate in the world | **9 to 12 fps in rooms and light outdoor views**: 110 ms a frame in the first rooms at about 4,700 draws (run 275), 86 to 102 ms on the water at about 1,300 draws (run 279). **5 to 6 fps in heavy outdoor views** (160 to 208 ms at 7,200 to 9,700 draws). A frame is about 70 ms plus 13 ms per 1,000 draws: the thread that prepares submissions is the limit, the card idles 12 to 40 ms a frame. It started at 3 to 6 seconds a frame. Measured with the switch set in `diagnostics/README.md` plus `VICTORY_CARD_HASH_LEN=1`; the defaults are slower |
+| Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known; crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`) is in the tree to find it |
+| Memory | about 23 to 27 GB of the PC's 32 GB and 9.2 to 9.6 GB of the card's 10.3 GB budget while playing |
 
-### Newest (2026-11-25, evening UTC)
+### Newest (2026-11-25, night UTC)
+
+**Small buffers into the card's memory: about 18 ms of card time a frame gone, 5 ms of frame so far.**
+Tested on the machine above, first rooms, at like draw counts (runs 274 and 275).
+- **Why some compute passes were slow.** A title buffer's host copy under 1 MiB stayed in the PC's
+  memory (about 3,700 of 3,800 copies, 30 MB in all), so every load, store and atomic a shader did
+  on it crossed the bus. The passes that were slow by the thread were small dispatches on such
+  buffers. `VICTORY_CARD_BUFFERS_MIN_KB=64` (with `VICTORY_CARD_BUFFERS_MB=1280`; off by default)
+  puts every copy in the card's memory: the title's lists went from 68.0 to 49.8 ms of card time a
+  frame; single passes from 6.7 to 1.6 ms, from 4.1, 2.7 and 2.0 ms to under 0.3 each. The frame:
+  114.9 -> 109.7 ms. The layer's own send-and-hash lists rose from 11.6 to 23.0 ms (each small copy
+  is hashed over a whole 64 KiB); `VICTORY_CARD_HASH_LEN=1` hashes the buffer's own bytes instead
+  and has not run in a game yet. The card now idles 12 to 40 ms a frame: the thread that prepares
+  submissions is the limit.
+- **`changed_runs` by masks** (the default; `VICTORY_CHANGED_RUNS=0` the old walk, `=alt` in turn):
+  64 bytes at a time as one mask of differing bytes. 3.8 ms less work a frame on the submitting
+  thread at equal draws; the frame's gain is inside the noise. A first form (64 equal bytes, then
+  eight at a time) was a fifth slower than the walk on sparse changes and never ran.
+- **Scalar buffer loads, four dwords a call** (`VICTORY_SHADER_OPT=127`; not in the default 63):
+  the dwords of one console load instruction are read by one call. Whole pack: with the bit off
+  25,635 of 25,635 shaders are byte-identical to the build before; with it on 20,154 change and
+  buffer loads fall by 38 %. Tested on the software adapter, also across a view's end. Whether a
+  card is faster for it is not measured yet.
+- **Pull request #999 merged** (cxy0072019-sketch, porting a patch by Geckomacabre):
+  `VICTORY_TEXTURE_BACK=1` copies textures of the ocean's kinds that shaders write back into title
+  memory, where the title's own code reads them. Off by default. Without it a boat sank here and
+  its mission failed at once (run 275). With it (run 276, both shader caches wiped first): 22,900
+  read-backs landed in six minutes of play and the tester got past that point: the largest step
+  of the day. The same run then ended with the card lost (the driver logged two errors, then
+  "device removed", with nothing of the layer's running on the card at that moment). Why is not
+  known; run 275, the same set without this switch, played twenty minutes without an error.
+- **What the copy-back is worth, measured** (`VICTORY_BACK_READS=alt`, diagnostics builds; run 277,
+  49 minutes of play): 497 GB were copied back from the card into title memory. Of 438,000 stores
+  looked at (one page in 8): 60 % were touched by nothing before the next store, 36 % only by the
+  layer's own refreshes, 3.8 % were written by the title, and 0.19 % were touched by anything
+  else, which is the most the title's own code can have read. So nearly all of that copying serves
+  nobody: not copying back the buffers nobody reads is the next step there.
+- **Run 279: the set that plays best so far.** The switches of `diagnostics/README.md` plus
+  `VICTORY_CARD_HASH_LEN=1`: the water is right (blue, waves, the sun's path), boats float, and the
+  layer's hash lists are about a quarter cheaper a list. That clears the hash length for the black
+  water of run 277, which leaves the grouped loads below as its cause. `VICTORY_ABSENT_ONCE=alt`
+  ran in it too: with it off the layer asked Windows about 690,000 times in twenty seconds about
+  blocks it already knew to be unmapped; with it on (notes kept 100 ms) 40 to 50 % of the answers
+  came from the notes. No frame gain shown yet at 100 ms: frames there are longer than the notes
+  live.
+- **The grouped scalar loads blackened the water** in run 277 (`VICTORY_SHADER_OPT=127`), and stay
+  off. The lead, not proven on the card: one call for four dwords at byte 328 of a 340-byte view
+  asks for a dword past its end, where the default form never reads that dword (its call is dead
+  code); 90 lighting programs have that load. The software adapter reads the three inside and
+  gives 0 for the one outside; what the card does is not tested.
+- **The card was lost twice**: run 276 after 6 minutes (two driver events, then a hang) and run 277
+  after 49 minutes (device removed with no driver event, 8 ms after a sweep let go 150 texture
+  copies). Causes not known. `diagnostics/` holds a scrubbed log of a short run with
+  `VICTORY_GPU_TIMING=1` and `VICTORY_D3D12_DRED=1` for anyone who wants real numbers.
+- **`VICTORY_ABSENT_ONCE=1|alt`** (off): a block of view memory found unmapped is not asked of
+  Windows again for 100 ms. Outdoors those questions were 44 ms a frame of the submitting thread.
+  Not run in a game yet. `VICTORY_D3D12_DRED=1` costs about 50 ms a frame in a diagnostics build.
+- The texture pass's time budget: never reached in the first rooms (about 5 ms a frame); 15 to
+  30 % of the frame in an open-world session. The translator emits no stack slots to promote:
+  registers are SSA values already.
+- Not run in this tree: the unit tests after the merge (the same changes passed them in the
+  working tree they came from: 182 of the graphics crate's, the new shader test both ways).
+
+### Earlier (2026-11-25, evening UTC)
 
 **Update, 2026-11-25 evening: a frame capture built into the layer, and a
 card time that does not add up yet.** No frame-rate gain is claimed; the

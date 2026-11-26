@@ -10,7 +10,13 @@ publisher.
 
 ## What is in it
 
-- fxceless/victory-fork `main` at `085ee7c` (frame-rate work, `INDIRECT_GATHER`, window upload)
+- fxceless/victory-fork `main` at `32b31f75` (frame-rate work, `INDIRECT_GATHER`, window upload,
+  `changed_runs` by masks, ocean texture read-back so boats float, cheaper card hashes)
+- 2 MiB sections for the title's physical memory: issue 1089's patch by RyanCase94 (on by default;
+  `VICTORY_SECTION_MB=0` turns it off). With the new `main` this took the open world here from
+  2.8 to 3.8 fps
+- Card copy census and `VICTORY_SKIP_WC_BACK`: pull request 868 (in the tree, left off)
+- `VICTORY_CARD_AWAKE` from avatarmanz/VIctory-7900XTX (in the tree, left off)
 - Series S picture: fxceless/victory-fork pull requests 188, 258, 883
 - Indirect draws and fence waits: pull requests 1016, 1014, 1020
 - Live ray tracing: pull request 814 (as merged in 905)
@@ -24,10 +30,11 @@ publisher.
 RTX 4060 Laptop 8 GB (driver 32.0.16.2140), i9-12900H, 16 GB RAM, 32 GB page file,
 Windows 11 26300, `--console series-s`, warm shader cache, 10-minute runs:
 
-| Where | Ray tracing | FPS (median) |
-|---|---|---|
-| Open world, safehouse | off | 2.7-2.9 (best 3.2) |
-| Open world, safehouse | on (`-RT`) | ~1.1-1.5 |
+| Build | Where | Ray tracing | FPS (median) |
+|---|---|---|---|
+| v2 | Open world, safehouse, about 5,200 draws a frame | off | **3.8** (two runs) |
+| v1 | same, back to back with v2 | off | 2.8 |
+| v1 | same | on (`-RT`) | ~1.1-1.5 |
 
 No crash in any of those runs. One machine only: treat it as a test build.
 
@@ -48,9 +55,9 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1 -Game "D:\path\to\game_scarle
 
 Add `-RT` for live ray tracing (better light and shadows, slower).
 
-The first launch translates and builds thousands of shaders: several minutes, slow or black
-screens. It can crash once in that time; start it again, the cache is kept. Cache and saves go
-to `%LOCALAPPDATA%\victory\cache` and `\data`.
+The first launch translates every shader before the game starts (about 6 minutes on all
+cores; `-SkipWarm` leaves that out). The game's first minutes can still be slow while the
+driver makes pipelines. Cache and saves go to `%LOCALAPPDATA%\victory\cache` and `\data`.
 
 ## Build from source
 

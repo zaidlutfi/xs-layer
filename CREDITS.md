@@ -18,6 +18,11 @@ This build is a merge; the work is theirs. All GPL-3.0-or-later unless noted.
     DexNom/VIctory 921d8d3, ddb7332, 76749ce)
   - 683 loop limit for compute programs
   - 842 copy-back join (VICTORY_BACK_JOIN)
+  - 868 card copy census, VICTORY_SKIP_WC_BACK
+  - 999 ocean texture read-back (cxy0072019-sketch, porting Geckomacabre's patch)
+- Issue 1089: 2 MiB sections, the patch by RyanCase94 (with data points from HLVM04 and
+  Exopus-0x65f7ad0).
+- avatarmanz/VIctory-7900XTX: VICTORY_CARD_AWAKE (commit 5f86fa30).
 - The upstream README in docs/UPSTREAM-README.md keeps the full credit list of victory-fork.
 
 Merge and tests on an 8 GB laptop: zaidlutfi, with Claude Code.

@@ -92,6 +92,7 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    let (asked_kind, asked_protect) = (kind, protect);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
@@ -154,6 +155,9 @@ pub extern "system" fn XMemVirtualAlloc(
         )
     };
     if base.is_null() {
+        // The census keeps what the title asked for (`VICTORY_CENSUS`).
+        #[cfg(windows)]
+        victory_gpu::title_memory_reserved(at as usize, size, asked_kind, flags, asked_protect);
         tracing::debug!(
             size,
             kind = format_args!("{kind:#x}"),
@@ -161,6 +165,11 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    // Memory committed for the title: the GPU side's notes that blocks there
+    // are uncommitted go (`VICTORY_ABSENT_ONCE`).
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::title_memory_committed(at as usize, size);
     }
     at
 }
@@ -408,57 +417,101 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    let Some(_) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    // Pagefile-backed sections of `size` bytes together, their pages
+    // committed when first mapped or written (`commit`): the title asks for
+    // 6.1 GiB at once, which a busy host often cannot commit (error 1450).
+    //
+    // Not one section for the whole request but one per `section_pages()`
+    // pages (2 MiB; `VICTORY_SECTION_MB=0`: one section, as before). Why:
+    // the title maps these pages a 64 KiB view at a time, so one section
+    // came to have views by the hundred thousand. Windows' worker that
+    // gathers physical memory into large pages (MiRebuildLargePages) trades
+    // such a section's pages one by one, looks through all of the section's
+    // views for each (MiViewMayContainPage) and holds the section meanwhile;
+    // every map and unmap of any of its pages waits for it. A kernel trace
+    // while the title streamed (RTX 4070 Ti, Ryzen 7 5800X, 2026-11-25): the
+    // worker 93 % of a core in exactly that, 806 of the title's map and
+    // unmap calls blocked for 2.6 s out of 4, 2.06 s of it released by that
+    // worker; frames of half a second and more. With small sections a trade
+    // looks through a few dozen views and holds only its own section.
+    let per = section_pages().unwrap_or(n).max(1);
+    let mut sections: Vec<(Arc<Section>, usize)> = Vec::with_capacity(n.div_ceil(per));
+    let mut left = n;
+    while left > 0 {
+        let pages_here = left.min(per);
+        let bytes = pages_here * PAGE;
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                // Under Wine a committed section is a sparse file, free until
+                // touched, and committing a reserved one page by page costs a
+                // wineserver request each that scans every range committed so
+                // far: commit it whole there.
+                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                (bytes as u64 >> 32) as u32,
+                bytes as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // All or nothing: the sections made so far close as they drop.
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        // For the GPU side's in-place census: only a committed section can
+        // be opened as a host heap.
+        victory_gpu::title_memory_section(handle as usize, bytes as u64, on_wine());
+        sections.push((Arc::new(Section(handle)), pages_here));
+        left -= pages_here;
     }
     tracing::debug!(
         n,
+        sections = sections.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    let mut k = 0;
+    for (section, pages_here) in sections {
+        for index in 0..pages_here {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            let number = first + k * FRAMES;
+            physical.pages.insert(number, slice);
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(k).write(number) };
+            k += 1;
+        }
     }
     1
+}
+
+/// How many 64 KiB pages a section of physical pages holds at most
+/// (`VICTORY_SECTION_MB`, 2 by default; 0: `None`, one section for each
+/// request however large).
+fn section_pages() -> Option<usize> {
+    static PAGES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *PAGES.get_or_init(|| {
+        let mb = std::env::var("VICTORY_SECTION_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2);
+        let pages = (mb << 20) / PAGE;
+        tracing::info!(
+            "physical pages: {} (VICTORY_SECTION_MB)",
+            if pages == 0 { "one section for each request".to_string() } else { format!("sections of {mb} MiB") }
+        );
+        (pages > 0).then_some(pages)
+    })
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of

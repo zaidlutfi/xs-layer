@@ -252,6 +252,7 @@ fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
 /// A buffer of `size` bytes at `offset` (a multiple of 64 KiB) of an
 /// opened heap, which shaders may read and write, in the common state.
 pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size: u64) -> windows::core::Result<ID3D12Resource> {
+    crate::census::made(7, size);
     let mut placed: Option<ID3D12Resource> = None;
     // The heap is cross-adapter shared, so the buffer must say so too.
     let flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -273,11 +274,11 @@ struct Views {
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
     /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    sections: BTreeMap<usize, (u64, bool)>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: BTreeMap::new() });
 
 /// The contiguous mapped run around `at` from `VIEWS`, as `(start, bytes)`.
 pub(crate) fn view_span(at: usize) -> Option<(u64, u64)> {
@@ -312,8 +313,7 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     {
         let mut v = views();
-        v.sections.retain(|s| s.0 != section);
-        v.sections.push((section, bytes, committed));
+        v.sections.insert(section, (bytes, committed));
     }
     // A view of our own made on an earlier section that had this handle's
     // number shows that section's pages, not this one's: it is forgotten
@@ -339,6 +339,30 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
+}
+
+/// For the census (`crate::census`): how many bytes of `[at, at + len)` are
+/// physical-page views, and how many of those show a page that has more
+/// than one address. Logging only.
+pub(crate) fn view_census(at: usize, len: usize) -> (usize, usize) {
+    let v = views();
+    let end = at.saturating_add(len);
+    let (mut in_views, mut multi) = (0, 0);
+    for (&base, &(vlen, section, offset)) in v.views.range(..end) {
+        let (lo, hi) = (base.max(at), (base + vlen).min(end));
+        if lo >= hi {
+            continue;
+        }
+        in_views += hi - lo;
+        let first = (lo - base) / K64;
+        let last = (hi - base).div_ceil(K64);
+        for k in first..last {
+            if v.pages.get(&(section, offset + (k * K64) as u64)).is_some_and(|l| l.len() > 1) {
+                multi += (base + (k + 1) * K64).min(hi) - (base + k * K64).max(lo);
+            }
+        }
+    }
+    (in_views, multi)
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -517,7 +541,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         if shown.len() > crate::watch::MANY_VIEWS {
             return None;
         }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
+        let section_bytes = v.sections.get(&section)?.0;
         (section, offset, shown, section_bytes)
     };
     if offset + bytes.len() as u64 > section_bytes {
@@ -539,11 +563,18 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
                 );
                 return None;
             }
-            tracing::info!(
-                section,
-                mb = section_bytes >> 20,
-                "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
-            );
+            // Sections are small and many (the runtime's `VICTORY_SECTION_MB`):
+            // the first few are said, the rest counted.
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if said < 4 || said.is_power_of_two() {
+                tracing::info!(
+                    section,
+                    mb = section_bytes >> 20,
+                    so_far = said + 1,
+                    "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
+                );
+            }
             Some(Own {
                 base: at.Value as usize,
                 bytes: section_bytes,
@@ -1161,7 +1192,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    for &(bytes, committed) in v.sections.values() {
         lines.push(format!(
             "census, a section of {} MB, {}",
             bytes >> 20,

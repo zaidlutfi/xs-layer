@@ -1,4 +1,4 @@
-﻿//! D3D12.X on host D3D12.
+//! D3D12.X on host D3D12.
 //!
 //! D3D12.X records commands from code inlined into the title, which writes
 //! packets into the command list while its put pointer is below a limit and
@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(all(windows, feature = "diagnostics"))]
+mod backreads;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -65,6 +67,8 @@ mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod census;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
@@ -79,15 +83,18 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
+pub use census::title_memory_reserved;
 pub use inplace::{
     title_memory_freeing, title_memory_section, title_memory_view,
 };
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };
