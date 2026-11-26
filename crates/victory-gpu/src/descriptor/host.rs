@@ -4243,8 +4243,13 @@ fn make_twinned(
                     && let Some(desc) = &mut desc
                 {
                     // SAFETY: a live texture.
-                    let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
-                    from_base(desc, copy.base, own_mips);
+                    let port = mip_port_enabled();
+                    let own_mips = if port {
+                        u32::from(unsafe { texture.GetDesc() }.MipLevels)
+                    } else {
+                        0
+                    };
+                    from_base(desc, copy.base, own_mips, port);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -4383,15 +4388,25 @@ fn make_twinned(
     }
 }
 
+/// VICTORY_MIP_ARRAY_CLAMP=1: 2D-array views and clamping to the host copy's
+/// levels (default off).
+fn mip_port_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MIP_ARRAY_CLAMP").is_ok_and(|v| v == "1"))
+}
+
 /// The view `desc` of a texture, of a host copy of its levels from `base`
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
 /// is left out. `own_mips` is the level count of the host copy (0: unknown,
 /// no clamping to it); 2D arrays are shifted the same as 2D textures, and
 /// the levels are kept within the copy's.
 ///
+/// `arrays` (the VICTORY_MIP_ARRAY_CLAMP=1 port) turns on array views; with it
+/// off and `own_mips` 0 this is the v3 behaviour.
+///
 /// Extension (arrays, clamping to the copy's levels) after Belobug's
 /// e942896 ("RX 9070 XT fixes & HUD ported onto upstream c9c932c").
-fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u32) {
+fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u32, arrays: bool) {
     let clamp_mips = |most: &mut u32, levels: &mut u32, lod: &mut f32| {
         let lost = base.saturating_sub(*most);
         *most = most.saturating_sub(base);
@@ -4412,7 +4427,7 @@ fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u3
             let t = unsafe { &mut desc.Anonymous.Texture2D };
             clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
         }
-        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY if arrays => {
             // SAFETY: the member its dimension says.
             let t = unsafe { &mut desc.Anonymous.Texture2DArray };
             clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
@@ -4889,7 +4904,7 @@ mod tests {
         let view = |first, levels, clamp| {
             let mut desc = srv_desc(&[98, 4, 5768, 0, first, levels, 0, 0, 0, 0]);
             desc.Anonymous.Texture2D.ResourceMinLODClamp = clamp;
-            from_base(&mut desc, 3, 10);
+            from_base(&mut desc, 3, 10, true);
             // SAFETY: the member its dimension says.
             let t = unsafe { desc.Anonymous.Texture2D };
             (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
@@ -4906,7 +4921,7 @@ mod tests {
     fn two_d_views_are_kept_within_the_levels_of_the_host_copy() {
         let view = |own, first, levels| {
             let mut desc = srv_desc(&[98, 4, 5768, 0, first, levels, 0, 0, 0, 0]);
-            from_base(&mut desc, 3, own);
+            from_base(&mut desc, 3, own, true);
             // SAFETY: the member its dimension says.
             let t = unsafe { desc.Anonymous.Texture2D };
             (t.MostDetailedMip, t.MipLevels)
@@ -4933,7 +4948,7 @@ mod tests {
         // [format, dimension, mapping, pad, most, levels, first slice, slices, plane, clamp bits]
         let array = |own, first, levels, clamp: f32| {
             let mut desc = srv_desc(&[98, 5, 5768, 0, first, levels, 2, 6, 0, clamp.to_bits()]);
-            from_base(&mut desc, 3, own);
+            from_base(&mut desc, 3, own, true);
             // SAFETY: the member its dimension says.
             let t = unsafe { desc.Anonymous.Texture2DArray };
             (t.MostDetailedMip, t.MipLevels, t.FirstArraySlice, t.ArraySize, t.ResourceMinLODClamp)
@@ -4949,7 +4964,7 @@ mod tests {
         assert_eq!(array(0, 9, 4, 0.0), (6, 4, 2, 6, 0.0));
         // Other dimensions are left as they are.
         let mut cube = srv_desc(&[98, 9, 5768, 0, 7, 5, 0, 0, 0, 0]);
-        from_base(&mut cube, 3, 4);
+        from_base(&mut cube, 3, 4, true);
         // SAFETY: the member its dimension says.
         let c = unsafe { cube.Anonymous.TextureCube };
         assert_eq!((c.MostDetailedMip, c.MipLevels), (7, 5));
