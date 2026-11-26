@@ -101,18 +101,23 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 };
                 found_here += 1;
                 t.containers += 1;
-                let dxil = container.part(FourCC::DXIL);
+                let dxil = container.part(FourCC::DXIL).or(container.part(FourCC::ACCC));
                 t.with_dxil_part += usize::from(dxil.is_some());
                 let program = dxil.and_then(|p| DxilProgram::parse(p.data).ok());
                 let mut listing = Vec::new();
                 // Independent of the bitcode: titles may strip it.
-                let native = match victory_shader::program_part(&container).map(native_programs) {
+                let native = match dxil.map(|p| native_programs(p.data)) {
                     Some(Ok(programs)) if !programs.is_empty() => {
                         t.with_native += 1;
                         let mut list = Vec::new();
                         for n in &programs {
                             *t.native_stages.entry(n.stage).or_default() += 1;
                             list.push(format!("{:?} {} B", n.stage, n.code.len()));
+                            if disasm {
+                                listing.push(format!("    {:?} stage I/O: {:?}", n.stage, n.io));
+                                listing.extend(n.layout.iter().map(|p| format!("    {p:?}")));
+                                listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
+                            }
                             match gfx10::decode(&n.code) {
                                 Ok(insts) => {
                                     t.decoded += 1;
@@ -122,9 +127,6 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
-                                        listing
-                                            .extend(n.layout.iter().map(|p| format!("    {p:?}")));
-                                        listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
                                         listing.extend(
                                             insts.iter().map(|i| format_instruction(i, n.wave64)),
                                         );
@@ -169,7 +171,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    // As a run's log and a replay name it (`hash=`).
+                    let hash = blake3::hash(&bytes).to_hex();
+                    println!("{}{} #{}: {line}", path.display(), source.label(), &hash[..16]);
                     for l in &listing {
                         println!("{l}");
                     }

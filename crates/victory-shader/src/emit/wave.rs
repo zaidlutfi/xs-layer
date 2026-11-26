@@ -139,14 +139,14 @@ pub(crate) enum Shape {
 }
 
 /// The section starting at instruction `start` of a block: its restore
-/// index and the shapes of the values it writes. The `v_readlane_b32`s of
-/// its values at constant lanes right after the restore (`end + 1` up to
-/// `after`) belong to it: they pick one lane of a partial result (lane 63
-/// of a wave64 reduction whose halves the code joined with lane 31's).
+/// index and the shapes of the values it writes.
 pub(crate) struct Section {
     pub end: usize,
-    pub after: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// What a `v_readlane_b32` of one lane takes, later in the block, from a
+    /// VGPR the section leaves (by the scalar it writes): the last lanes of
+    /// a reduction hold it before the first do.
+    pub reads: HashMap<Value, Shape>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -184,17 +184,26 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let (vec, mut uni) = simulate(&insts[i + 1..end], wave, saved);
-        let mut after = end + 1;
-        while let Some(inst) = insts.get(after)
-            && let Some((w, lane)) = readlane(inst, &vec, wave)
-        {
-            uni.insert(w, lane);
-            after += 1;
+        let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
+        let mut reads = HashMap::new();
+        for later in insts[end + 1..].iter().filter(|i| i.name() == "v_readlane_b32") {
+            if let Fields::Valu(v) = &later.fields
+                && let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, lane]) =
+                    (v.dst, &v.src[..])
+                && let Some(left) = later.read(Reg::V(*reg)).and_then(|x| vec.get(&x))
+                && let Some(w) = later.write(Reg::S(code))
+                && let Some(l) = lane_number(lane)
+                && let Some(&sym) = left.get(l as usize)
+                // (a lane's own value stays a lane read)
+                && !matches!(sym, Sym::Own(_))
+                && let Some(shape) = single(sym, wave)
+            {
+                reads.insert(w, shape);
+            }
         }
         let shapes = shapes(vec, uni, wave);
-        out.insert(i, Section { end, after, shapes });
-        i = after;
+        out.insert(i, Section { end, shapes, reads });
+        i = end + 1;
     }
     out
 }
@@ -280,35 +289,19 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-/// A `v_readlane_b32` at a constant lane of a value the section wrote:
-/// what it writes and that lane's value.
-fn readlane(inst: &Inst, vec: &HashMap<Value, Vec<Sym>>, wave: u32) -> Option<(Value, Sym)> {
-    let Fields::Valu(v) = &inst.fields else {
-        return None;
-    };
-    if inst.name() != "v_readlane_b32" {
-        return None;
+/// The lane a `v_readlane_b32` names.
+fn lane_number(op: &Operand) -> Option<u32> {
+    match *op {
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Literal(x) => Some(x),
+        _ => None,
     }
-    let (Some(Operand::Scalar { code, .. }), Some(&Operand::Vector { reg, .. }), Some(lane)) =
-        (v.dst, v.src.first(), v.src.get(1))
-    else {
-        return None;
-    };
-    let l = match *lane {
-        Operand::Const(c) => crate::resource::inline(c)?,
-        Operand::Literal(x) => x,
-        _ => return None,
-    };
-    let lanes = vec.get(&inst.read(Reg::V(reg))?)?;
-    let s = *lanes.get(l as usize).filter(|_| l < wave)?;
-    Some((inst.write(Reg::S(code))?, s))
 }
 
-/// Each lane's value of the vector values the section writes, and the
-/// uniform values.
-type Simulated = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>);
+/// The lanes' values of the VGPRs the section writes, and its scalars.
+type Left = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>);
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -411,11 +404,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
             else {
                 continue;
             };
-            let l = match *lane {
-                Operand::Const(c) => crate::resource::inline(c),
-                Operand::Literal(x) => Some(x),
-                _ => None,
-            };
+            let l = lane_number(lane);
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
                 let s = l
@@ -728,19 +717,10 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
-/// The shape of each value, where every lane agrees on one.
-fn shapes(
-    vec: HashMap<Value, Vec<Sym>>,
-    uni: HashMap<Value, Sym>,
-    wave: u32,
-) -> HashMap<Value, Shape> {
-    let all = if wave == 64 {
-        u64::MAX
-    } else {
-        u64::from(u32::MAX)
-    };
-    let mut out = HashMap::new();
-    let single = |s: Sym| match s {
+/// The shape of a scalar.
+fn single(s: Sym, wave: u32) -> Option<Shape> {
+    let all = u64::MAX >> (64 - wave);
+    match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
@@ -758,9 +738,19 @@ fn shapes(
             high,
         } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
         _ => None,
-    };
+    }
+}
+
+/// The shape of each value, where every lane agrees on one.
+fn shapes(
+    vec: HashMap<Value, Vec<Sym>>,
+    uni: HashMap<Value, Sym>,
+    wave: u32,
+) -> HashMap<Value, Shape> {
+    let all = u64::MAX >> (64 - wave);
+    let mut out = HashMap::new();
     for (v, s) in uni {
-        if let Some(sh) = single(s) {
+        if let Some(sh) = single(s, wave) {
             out.insert(v, sh);
         }
     }
@@ -1112,6 +1102,40 @@ mod tests {
             );
             assert_eq!(sec.shapes.get(&v4_val), None);
         }
+    }
+
+    /// A wave OR whose last step stays in the section's VGPR: the lower
+    /// lanes add the first half's to themselves, so only the upper ones
+    /// hold the whole, and the last lane is read after the section (an
+    /// upscaler's programs).
+    #[test]
+    fn one_lane_of_what_a_section_leaves_is_read_after_it() {
+        let words = |lane: u32| {
+            let mut w = WAVE_OR_V7_TO_S7[..14].to_vec(); // .. v_or_b32 v1, v2, v1
+            w.extend([
+                0xD760_0007,
+                0x0001_0101, // v_readlane_b32 s7, v1, 0
+                0x3802_0207, // v_or_b32 v1, s7, v1
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                0xD760_0006,
+                0x0001_0101 | lane << 9, // v_readlane_b32 s6, v1, lane
+                S_ENDPGM,
+            ]);
+            w
+        };
+        let read = |lane: u32| {
+            let p = build(&words(lane), true);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(4)).unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+            let got = insts[insts.len() - 2].write(Reg::S(6)).unwrap();
+            let sec = &sections(&p, 0)[&0];
+            (sec.reads.get(&got).copied(), Shape::Active(Op::Or, v7, saved, 0))
+        };
+        let (found, whole) = read(63);
+        assert_eq!(found, Some(whole));
+        // Lane 0 has the first half's alone: still a lane read.
+        assert_eq!(read(0).0, None);
     }
 
     /// `WaveActiveSum` of 16-bit floats, as compiled in

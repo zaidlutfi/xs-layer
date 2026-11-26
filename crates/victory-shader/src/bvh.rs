@@ -32,10 +32,9 @@
 //! Four child pointers at bytes 0-15 (`0xffff_ffff`: none), then four
 //! boxes, each minimum x y z, maximum x y z: 16-bit floats from byte 16
 //! (12 bytes a box), or 32-bit floats from byte 16 (24 bytes a box; bytes
-//! 112-127 are not read). The result is the pointers of the children that
-//! are there and whose box the ray enters before its extent, nearest entry
-//! first when the descriptor enables box sorting (bit 63), and
-//! `0xffff_ffff` for the rest.
+//! 112-127 are not read). The result is the pointers of the children whose
+//! box the ray enters before its extent, nearest entry first when the
+//! descriptor enables box sorting (bit 63), and `0xffff_ffff` for the rest.
 //!
 //! # Triangle nodes
 //!
@@ -65,10 +64,9 @@
 //! JCGT 2013), and agree with what the title's own structure
 //! builder writes and its trace programs read. Not known from either: how
 //! the console rounds, which of two boxes entered at the same distance it
-//! returns first, what it returns for a ray exactly through an edge (here:
-//! a hit in both triangles of the edge), for a child that is not there
-//! whose box the ray enters (here: a miss) or for kinds 6 and 7 (here: a
-//! triangle miss; the title's programs do not read it).
+//! returns first, and what it returns for a ray exactly through an edge
+//! (here: a hit in both triangles of the edge) or for kinds 6 and 7 (here:
+//! a triangle miss; the title's programs do not read it).
 
 /// The result dword for a box the ray misses, or a child that is not there.
 pub const NONE: u32 = 0xffff_ffff;
@@ -198,13 +196,11 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         }
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
-        // A child that is not there is a miss, whatever bytes its box holds;
-        // every axis must be ordered (`min <= max`): ordered compares reject
-        // both inverted/empty boxes (`min > max`, e.g. +inf..-inf or BOX16
-        // +65504..-65504) and any NaN in any of the six coordinates (which
-        // IEEE minNum/maxNum would otherwise drop).
-        let there = children[n] != NONE && b[0] <= b[3] && b[1] <= b[4] && b[2] <= b[5];
-        if there && leave >= enter.max(0.0) && enter < ray.extent {
+        // A box whose minimum x is NaN is switched off. A child that is not
+        // there may have inverted infinite bounds, which every ray enters at
+        // minus infinity: it would be first of the sorted children and end
+        // the walk before them (DexNom/VIctory bc3cd4b0).
+        if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
         }
@@ -293,6 +289,17 @@ pub fn half_to_f32(h: u16) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// An empty slot's inverted infinite bounds do not come before the
+    /// children a ray enters (after DexNom/VIctory bc3cd4b0).
+    #[test]
+    fn an_empty_slot_is_never_entered() {
+        let inside = |x: f32| [x - 1.0, -1.0, -1.0, x + 1.0, 1.0, 1.0];
+        let (up, down) = (f32::INFINITY, f32::NEG_INFINITY);
+        let bounds = [inside(30.0), [up, up, up, down, down, down], inside(10.0), [up, up, up, down, down, down]];
+        let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
+        assert_eq!(boxes(&[8, NONE, 16, NONE], &bounds, &ray, true), [16, 8, NONE, NONE]);
+    }
 
     /// The smallest 16-bit float not below `x` (`up`) or not above it.
     pub(crate) fn f32_to_half(x: f32, up: bool) -> u16 {
@@ -480,79 +487,8 @@ pub(crate) mod tests {
             [UNIT, UNIT, [f32::NAN, -1.0, -1.0, 1.0, 1.0, 1.0], OFF],
         );
         let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
-        // Child 1's box is entered, but child 1 is not there: a miss.
+        // Child 1 is hit but is not there: its pointer is what "none" is.
         assert_eq!(intersect(&node, 5, &ray, true), [8, NONE, NONE, NONE]);
-    }
-
-    /// A node whose children that are not there have boxes the ray
-    /// enters: the first before the one child's, the other two at the
-    /// ray's origin. (The card tests run it too.)
-    pub(crate) const MISSING_FIRST: ([u32; 4], [[f32; 6]; 4]) = (
-        [NONE, 8, NONE, NONE],
-        [
-            [-1.0, -1.0, 1.0, 1.0, 1.0, 2.0],
-            [-1.0, -1.0, 3.0, 1.0, 1.0, 4.0],
-            [0.0; 6],
-            [0.0; 6],
-        ],
-    );
-
-    /// The ray of [`MISSING_FIRST`]: from the origin along +z.
-    pub(crate) fn missing_first() -> Ray {
-        Ray::new([0.0; 3], [0.0, 0.0, 1.0], 10.0)
-    }
-
-    #[test]
-    fn a_child_that_is_not_there_is_a_miss_whatever_its_box() {
-        let (children, boxes) = MISSING_FIRST;
-        let ray = missing_first();
-        for (node, kind) in [(box32(children, boxes), 5), (box16(children, boxes), 4)] {
-            // Sorted: the child that is there (entered at 3), then the
-            // three that are not, their boxes entered at 0 and 1.
-            assert_eq!(
-                intersect(&node, kind, &ray, true),
-                [8, NONE, NONE, NONE],
-                "kind {kind}"
-            );
-            // Not sorted: child order.
-            assert_eq!(intersect(&node, kind, &ray, false), children, "kind {kind}");
-        }
-    }
-
-    #[test]
-    fn partial_axis_nan_and_inverted_boxes_miss_in_box32_and_box16() {
-        let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
-        // Any single NaN coordinate (including b[1..6], where minNum/maxNum
-        // would drop the NaN) must miss in both BOX32 and BOX16.
-        for coord in 0..6 {
-            let mut bad = UNIT;
-            bad[coord] = f32::NAN;
-            let n32 = box32([8, 16, 24, 32], [bad, OFF, OFF, OFF]);
-            let n16 = box16([8, 16, 24, 32], [bad, OFF, OFF, OFF]);
-            assert_eq!(intersect(&n32, 5, &ray, true), [NONE; 4], "box32 coord {coord}");
-            assert_eq!(intersect(&n16, 4, &ray, true), [NONE; 4], "box16 coord {coord}");
-        }
-        // Empty/inverted boxes (min > max on one or all axes, +inf..-inf, or
-        // BOX16 +65504..-65504) must miss rather than having low/high swapped.
-        let empty_inf = [
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-        ];
-        let inverted_y = [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0];
-        let inverted_all = [1.0, 1.0, 1.0, -1.0, -1.0, -1.0];
-        let zero_thick = [0.0, -1.0, -1.0, 0.0, 1.0, 1.0];
-        let boxes = [empty_inf, inverted_y, inverted_all, zero_thick];
-        let n32 = box32([8, 16, 24, 32], boxes);
-        let n16 = box16([8, 16, 24, 32], boxes);
-        // Only child 3 (zero-thickness box at x = 0, min == max) is valid and hit.
-        assert_eq!(intersect(&n32, 5, &ray, true), [32, NONE, NONE, NONE]);
-        assert_eq!(intersect(&n16, 4, &ray, true), [32, NONE, NONE, NONE]);
-        assert_eq!(intersect(&n32, 5, &ray, false), [NONE, NONE, NONE, 32]);
-        assert_eq!(intersect(&n16, 4, &ray, false), [NONE, NONE, NONE, 32]);
     }
 
     #[test]

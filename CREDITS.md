@@ -26,3 +26,22 @@ This build is a merge; the work is theirs. All GPL-3.0-or-later unless noted.
 - The upstream README in docs/UPSTREAM-README.md keeps the full credit list of victory-fork.
 
 Merge and tests on an 8 GB laptop: zaidlutfi, with Claude Code.
+
+## v3 (2026-11-26)
+
+v3 moves to another tree; the list above is what v1 and v2 were made of.
+
+- **cool_fox** by codec_d: the tree v3 is exported from, at its commit `f4b48ad`
+  (NVIDIA Wave32 lowering, Series S two-plane present, residency budgets).
+  https://github.com/codec-d/cool_fox
+- **VIctory-7900XTX** by avatarmanz, which cool_fox is built on (relay and landing of shader
+  writes, card steps, batched indirect clamps, textures on a copy queue of their own), and the
+  work it carries from DexNom/VIctory, Belobug/VIctory-Belobug-AMD, FQY55kai/ZJOU-VICTORY and
+  myokex/victory-amd. https://github.com/avatarmanz/VIctory-7900XTX
+- **victory-laptop-8gb** by lordon1a: the settings in `run.ps1` are its measured set for an
+  8 GB laptop card with 16 GB of RAM, and its test log is why three switches are left out.
+  https://github.com/lordon1a/victory-laptop-8gb
+- docs/UPSTREAM-README.md is cool_fox's README with its own credit list.
+
+Changes here against cool_fox `f4b48ad`: the title's name taken out of five comments, its
+launcher and bug journal left out, `run.ps1`, this file and the README.

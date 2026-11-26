@@ -5,14 +5,11 @@
 //! `XDAT` table before it indexing blobs after it, among them `xbop`
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
-//! Precompiled programs without a `DXIL` part keep the code in an `ACCC`
-//! part instead ([`fspx`]).
 
 pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
-pub mod fspx;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
@@ -25,7 +22,6 @@ pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
-    program_part,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

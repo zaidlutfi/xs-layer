@@ -17,6 +17,10 @@
 //! execution was followed by a move of the scratch buffer back to the
 //! common state, which drivers may treat as a full wait.
 //!
+//! The executions of one record without a count buffer (all the title's)
+//! are clamped in batches ([`batch`], `VICTORY_INDIRECT_BATCH`): the rest of
+//! this is for the others.
+//!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
 //! tail slots. Each list has a budget (2^27 vertex instances or threads,
@@ -24,8 +28,8 @@
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
 //! garbage records cannot run for seconds either.
 //!
-//! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
+//! shortcut: the bounds (below 2^23 vertices an instance, 2^26 vertex instances, 65,535
+//! groups per dimension, in x 2^20 ([`widest`]), and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
@@ -36,6 +40,8 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
+pub(crate) mod batch;
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
@@ -45,9 +51,7 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing. Bit 2: the records are gathered
-    // (`gather`): record i lies in the source where word i of the table
-    // behind `count_buf` says (from `count_offset` on), and goes to slot i.
+    // run is left empty and costs nothing.
     uint has_count;
     uint count_offset;
 };
@@ -69,76 +73,54 @@ static const uint GROUPS = 1u << 20;
 // round for each record of a window, and in memory the CPU maps (where the
 // budget was, and is with VICTORY_INDIRECT_CARD_BUDGET=0) every atomic
 // crosses the bus on a card of its own.
-#ifndef SINGLE_RECORD
 groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
-#endif
 [RootSignature(RS)]
-#ifdef SINGLE_RECORD
-[numthreads(1, 1, 1)]
-#else
 [numthreads(64, 1, 1)]
-#endif
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    // Only the multi-record kernel needs inactive lanes at its barriers.
+    // Threads past the records take part in the group's charge (cost 0)
+    // and store nothing.
     bool active = id.x < eff_count;
-#ifdef SINGLE_RECORD
-    if (!active) return;
-#endif
     uint src_at = args_offset + id.x * stride;
-    // (A branch, not a select: without the bit the view behind `count_buf`
-    // is a count of four bytes, or the source itself, and is not read here.)
-    [branch]
-    if ((has_count & 4u) != 0) {
-        src_at = count_buf.Load(count_offset + id.x * 4u);
-    }
     uint dst_at = id.x * stride;
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
-#ifndef SINGLE_RECORD
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
     }
-#endif
     if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint2 want = src_args.Load2(src_at);
         if (ahead && (want.x > (1u << 24) || want.y > (1u << 24))) {
             want = uint2(0, 0);
         }
-        uint count = min(want.x, 1u << 24);
+        // A record of MOST_DRAW vertices or indices an instance, or more, is
+        // no draw of the title's (a slot it has not filled): it runs empty
+        // and charges nothing (victory-fork f85101b6, its window checker
+        // found 90 of 2^24 vertices in one list).
+        if (want.x >= MOST_DRAW) {
+            want = uint2(0, 0);
+        }
+        uint count = want.x;
         uint instances = min(want.y, (1u << 26) / max(count, 1u));
         cost = count * instances;
-        // A record that asks for MOST_DRAW vertices or indices an instance
-        // or more is no draw of the title's (no mesh of a console title has
-        // 2.8 million triangles): it runs empty and charges nothing. Run
-        // 206's window check found one list with 90 draws of 2^24 vertices
-        // and one instance each. Clamped one draw at a time, the list's
-        // budget lets eight of them run (2^27 in all) and empties the other
-        // 82; served from a window, whose records are charged once however
-        // often they are drawn, all 90 ran: 1.5 thousand million vertices
-        // in one list, with windows on in the runs that lost the device
-        // (201, 204).
-        if (count >= MOST_DRAW) {
-            count = 0;
-            instances = 0;
-            cost = 0;
-        }
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        uint3 g = src_args.Load3(src_at);
+        // Up to WIDEST groups in x run as asked (`widest`).
+        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        // x * y fits 32 bits where it is looked at; the whole count may not.
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64u;
@@ -146,10 +128,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     } else if (active) {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
-        // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (the title leaves all
-        // ones there): empty, and not counted below either.
-        if (ahead && g.x > 65535u) {
+        // A record over the most a dispatch runs is a slot the title has
+        // not filled (the title leaves all ones there): empty,
+        // and not counted below either. (65,535 groups of meshlets read
+        // through the garbage beside it read past every buffer.)
+        if (g.x > 65535u) {
             g = uint3(0, 0, 0);
         }
         asked = g.x;
@@ -157,27 +140,6 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
-#ifdef SINGLE_RECORD
-    bool over = false;
-    if (cost != 0) {
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = min(BUDGET - before, cost) + before;
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
-        }
-        over = before >= BUDGET || BUDGET - before < cost;
-    }
-    if (kind > 2) {
-        uint was;
-        budget.InterlockedMax(4, asked, was);
-        budget.InterlockedAdd(8, min(asked, 1u << 24), was);
-    }
-#else
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
     if (active && kind > 2) {
@@ -195,7 +157,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
     if (gi == 0 && n > 0) {
         // What the records charge, from `before` on, in lane order: a
-        // record that does not fit whole runs empty and takes the rest.
+        // record that does not fit whole runs empty and takes the rest
+        // (`rest`).
         // Only the group's own records are walked (one, clamped alone).
         uint before;
         budget.InterlockedOr(0, 0, before);
@@ -205,7 +168,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             for (uint j = 0; j < n; j++) {
                 uint c = costs[j];
                 if (c > 0 && next < BUDGET) {
-                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
+                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
                 }
             }
             if (next == before) break;
@@ -215,14 +178,27 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             before = prev;
         }
         uint at = before;
+        uint refused = 0;
+        uint biggest = 0;
         for (uint k = 0; k < n; k++) {
             uint c = costs[k];
             uint fit = 1;
             if (c > 0) {
                 fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
-                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
+                refused += 1 - fit;
+                biggest = max(biggest, c);
             }
             fits[k] = fit;
+        }
+        // Diagnostics: the records that run empty for want of budget, and
+        // the largest cost there was (small ones are not told).
+        uint told;
+        if (refused > 0) {
+            budget.InterlockedAdd(12, refused, told);
+        }
+        if (biggest >= (1u << 22)) {
+            budget.InterlockedMax(16, biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -235,7 +211,6 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         return;
     }
     bool over = fits[gi] == 0;
-#endif
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -288,35 +263,50 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     make_from(device, SOURCE)
 }
 
-fn make_single(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    make_from(device, &format!("#define SINGLE_RECORD\n{SOURCE}"))
+/// The most groups in x that an indirect dispatch runs as the title asks:
+/// 65,535 is the most D3D12 names for a dispatch, 2^20 ([`SOURCE`]'s GROUPS)
+/// what is bounded here anyway (`VICTORY_INDIRECT_WIDE=0`: 65,535; a record
+/// that asks for more still runs 65,535).
+///
+/// The title's tile lists are dispatches of one group per tile, and two of
+/// them are classes of the picture's 8x4 tiles, 115,200 in all at
+/// 2560x1440: in a captured frame 67,440 and 47,760 (the program
+/// 2dc364df5d3278b8 and 940c2635dc1312f4). Cut to 65,535 the first list lost
+/// its last 1,905 tiles, the lowest of the picture. The console runs what it
+/// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
+/// dispatch packets and group numbers are the same; D3D12 does not look at
+/// indirect counts. Other cards stay at 65,535.
+fn widest(amd: bool) -> u32 {
+    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
+    if amd && on { 1 << 20 } else { 65_535 }
 }
 
-/// Opt-in specialization for the indirect calls that still clamp by themselves.
-fn clamp_for(records: u32) -> Option<&'static Clamp> {
-    static SINGLE: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
-    if records == 1
-        && let Some(single) = SINGLE.get_or_init(|| {
-            if std::env::var_os("VICTORY_INDIRECT_SINGLE").is_none_or(|v| v != "1") {
-                return None;
-            }
-            match make_single(&host()?.device) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::warn!(error = %e, "single-record argument clamp unavailable");
-                    None
-                }
-            }
-        })
-    {
-        return Some(single);
+/// Whether `device` is an AMD card's.
+pub(crate) fn amd(device: &ID3D12Device) -> bool {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    // SAFETY: plain queries.
+    unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|d| d.VendorId == 0x1002)
     }
-    clamp()
+}
+
+/// Whether a record that does not fit in what is left of its list's budget
+/// takes the rest, so that every record after it runs empty too
+/// (`VICTORY_INDIRECT_REST=1`; off by default so one oversized record takes
+/// nothing and later valid draws still run).
+fn rest() -> u32 {
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    #[cfg(feature = "diagnostics")]
+    let batched = source == batch::SOURCE;
+    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -362,6 +352,8 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
             },
             ..Default::default()
         })?;
+        #[cfg(feature = "diagnostics")]
+        crate::host::name(&pso, || crate::replay::play::CLAMP.into());
         Ok(Clamp { root, pso })
     }
 }
@@ -408,7 +400,7 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp_for(spec.2)?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
 
@@ -428,7 +420,7 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp_for(spec.2)?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
@@ -559,260 +551,16 @@ fn record_clamp_as(
     true
 }
 
-/// The most records of one argument buffer gathered for a list
-/// ([`gather`]): a multiple of the clamp's 64 threads a group, so that the
-/// threads past the last record read inside the table.
-pub(crate) const GATHER_MOST: u32 = 4096;
-/// The widest record gathered: its slot in the scratch buffer.
-pub(crate) const GATHER_STRIDE: u32 = 32;
-
-/// The records of one argument buffer that a list's draws read, to be
-/// clamped in one pass before the list runs ([`gather`]): the buffer (a
-/// host copy, and its number), the records' kind and stride, the scratch
-/// buffer whose slot `i` holds record `i` clamped, and the table of the
-/// records' offsets in the buffer (upload memory of the list).
-pub(crate) struct GatherSet {
-    pub(crate) src: ID3D12Resource,
-    pub(crate) src_id: u64,
-    pub(crate) kind: u32,
-    pub(crate) stride: u32,
-    pub(crate) scratch: ID3D12Resource,
-    table_gpu: u64,
-    table: usize,
-    /// A record's offset in the buffer, and its slot.
-    slots: std::collections::HashMap<u32, u32>,
-}
-
-// SAFETY: D3D12 objects are free-threaded; the table is the list's own
-// upload memory, written under the list's lock before the list is submitted.
-unsafe impl Send for GatherSet {}
-
-impl GatherSet {
-    pub(crate) fn new(src: ID3D12Resource, src_id: u64, (kind, stride): (u32, u32), scratch: ID3D12Resource, (table_gpu, table): (u64, *mut u8)) -> Self {
-        Self { src, src_id, kind, stride, scratch, table_gpu, table: table as usize, slots: Default::default() }
-    }
-
-    /// The records gathered so far.
-    pub(crate) fn records(&self) -> u32 {
-        self.slots.len() as u32
-    }
-
-    /// The slot of the record at `offset`: the one it has, or the next
-    /// free one. None when the set is full.
-    pub(crate) fn slot(&mut self, offset: u32) -> Option<u32> {
-        if let Some(&slot) = self.slots.get(&offset) {
-            return Some(slot);
-        }
-        let slot = self.slots.len() as u32;
-        if slot >= GATHER_MOST {
-            return None;
-        }
-        // SAFETY: the table holds `GATHER_MOST` words.
-        unsafe { (self.table as *mut u32).add(slot as usize).write_volatile(offset) };
-        self.slots.insert(offset, slot);
-        Some(slot)
-    }
-
-    /// The scratch buffer `src`'s set uses, to keep for the list's next recording.
-    pub(crate) fn into_scratch(self) -> ID3D12Resource {
-        self.scratch
-    }
-}
-
-/// Whether [`gather`] can take a record of `kind` and `stride` at `offset`
-/// of a buffer at `src_gpu`: what [`record_gather_as`] asks of its
-/// arguments, checked when the record is taken, because a record once
-/// given a slot is drawn from the slot.
-pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) -> Option<u32> {
-    let min = min_stride(kind)?;
-    if stride < min || stride > GATHER_STRIDE || !stride.is_multiple_of(4) || !offset.is_multiple_of(4) || !src_gpu.is_multiple_of(4) {
-        return None;
-    }
-    u32::try_from(offset).ok().filter(|o| o.checked_add(stride).is_some())
-}
-
-/// For a single record of `kind` and `stride` at `offset` of the host copy
-/// `src` (its number `src_id`) that a draw of `list` is about to read: a
-/// slot in the list's scratch buffer for that argument buffer, which the
-/// list's prelude fills with the record clamped, in one pass with all the
-/// other records the list's draws read (`HostList::prelude`,
-/// [`record_gathers`]). Nothing is recorded in the list. The scratch
-/// buffer and the record's place in it; None if the list no longer
-/// gathers (something in it may write arguments), the set is full, or the
-/// record does not fit the clamp: the caller clamps it as before.
-///
-/// Why: the title keeps its mesh records scattered through one argument
-/// buffer of about 100 MB (from one draw to the next 16 to 33,056 bytes
-/// on, or back), so a window of records at one step cannot serve them, and
-/// about 1,450 draws a frame each had a compute pass of ours in front of
-/// them: the card left drawing for compute and came back, about nine
-/// microseconds each (run 243, and the windows' own measurement).
-pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64)> {
-    clamp()?;
-    // SAFETY: a live D3D12 buffer resource.
-    let Some(offset) = gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, spec) else {
-        GATHER_NONE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return None;
-    };
-    list.gather_slot(src, src_id, offset, spec)
-}
-
-/// Since the last line: records that got no slot because they do not fit
-/// the clamp, because their list had stopped gathering, because the list
-/// gathers from too many buffers, because their set was full, because a
-/// buffer could not be made.
-pub(crate) static GATHER_NONE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
-
-/// Records the clamp of `records` gathered records into `dst`, which is in
-/// state `before`, and leaves `dst` in `INDIRECT_ARGUMENT`: record `i` is
-/// read at the offset word `i` of the table at `table_gpu` names, in the
-/// buffer `src`, and stored clamped at `i * stride`. Charged to the budget
-/// word at `budget` as records clamped one by one are. False, with nothing
-/// recorded, if the layout or the addresses do not fit the clamp.
-fn record_gather_as(
-    c: &Clamp,
-    l: &ID3D12GraphicsCommandList,
-    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
-    budget: u64,
-    src: &ID3D12Resource,
-    table_gpu: u64,
-    (kind, stride, records): (u32, u32, u32),
-) -> bool {
-    // SAFETY: live D3D12 buffer resources.
-    let (src_gpu, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
-    if gatherable(src_gpu, 0, (kind, stride)).is_none()
-        || records == 0
-        || records > GATHER_MOST
-        || !dst_gpu.is_multiple_of(4)
-        || !budget.is_multiple_of(4)
-        || !table_gpu.is_multiple_of(4)
-    {
-        return false;
-    }
-    let constants = [kind, stride, records, 0u32, 4u32, 0u32];
-    let first = [uav_barrier(), transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
-    let second = [
-        uav_barrier(),
-        transition(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
-    ];
-    // SAFETY: an open list; our root signature and pipeline; live source,
-    // table, scratch destination and budget buffers. The first wait puts
-    // the pass behind every earlier shader write (the title's argument
-    // passes of the lists before); the second puts the list's draws behind
-    // the pass.
-    unsafe {
-        l.ResourceBarrier(&first);
-        l.SetComputeRootSignature(&c.root);
-        l.SetPipelineState(&c.pso);
-        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-        l.SetComputeRootShaderResourceView(1, src_gpu);
-        l.SetComputeRootShaderResourceView(2, table_gpu);
-        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-        l.SetComputeRootUnorderedAccessView(4, budget);
-        l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&second);
-    }
-    true
-}
-
-/// Records, into a list's prelude `l`, the passes that fill the scratch
-/// buffers of `sets` ([`gather`]), charged to the words of `budget`, which
-/// is zeroed first (the gathered records have a budget of their own: the
-/// list's own clamps zero and charge theirs inside the list, after this).
-/// False if anything could not be recorded: the slots then hold no clamped
-/// records and the list must not run.
-pub(crate) fn record_gathers(l: &ID3D12GraphicsCommandList, sets: &[GatherSet], budget: &ID3D12Resource) -> bool {
-    use windows::core::Interface;
-    let (Some(c), Ok(l2)) = (clamp(), l.cast::<ID3D12GraphicsCommandList2>()) else {
-        return false;
-    };
-    // SAFETY: a live buffer.
-    let at = unsafe { budget.GetGPUVirtualAddress() };
-    let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + offset, Value: 0 });
-    // SAFETY: an open list; the budget buffer is the list's own and common
-    // between its runs.
-    unsafe {
-        l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
-        l2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
-        l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
-    }
-    let mut all = true;
-    for set in sets.iter().filter(|s| s.records() > 0) {
-        all &= record_gather_as(c, l, (&set.scratch, D3D12_RESOURCE_STATE_COMMON), at, &set.src, set.table_gpu, (set.kind, set.stride, set.records()));
-    }
-    // SAFETY: as above.
-    unsafe {
-        l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)]);
-    }
-    all
-}
-
-/// Whether every draw served from a window is checked against a fresh
-/// clamp of its record (`VICTORY_INDIRECT_WINDOW_CHECK=1`, with
-/// `VICTORY_INDIRECT_WINDOW=1`; off by default). A window clamps its
-/// records once, ahead of their draws; if anything wrote a record between
-/// the window's clamp and its draw, the draw reads the old one. The check
-/// clamps the record again just before the draw (into a buffer of its own,
-/// charging a budget of its own) and compares the two on the card: the
-/// counts are logged ("window check"), and the first record that differs in
-/// each run of a list is named. For telling whether windows can be trusted
-/// in a scene before they are on by default; it costs a clamp and a compare
-/// per window draw.
-pub(crate) fn window_check() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_INDIRECT_WINDOW_CHECK").is_some_and(|v| v == "1")
-    })
-}
-
-/// The compare of [`window_check`]: `words` dwords of the record a window
-/// clamped (`t0`) against the same record clamped just now (`t1`). Counts
-/// the checks and the records that differ in `u0`, keeps the first record
-/// that differs there (eight dwords of each), and zeroes the fresh clamp's
-/// own budget (`u1`) for the next check.
-const CHECK_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
-cbuffer Check : register(b0) {
-    uint words;
-};
-ByteAddressBuffer window_record : register(t0);
-ByteAddressBuffer fresh_record : register(t1);
-RWByteAddressBuffer results : register(u0);
-RWByteAddressBuffer fresh_budget : register(u1);
-[RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void main() {
-    bool same = true;
-    for (uint i = 0; i < words; i++) {
-        if (window_record.Load(4 * i) != fresh_record.Load(4 * i)) {
-            same = false;
-        }
-    }
-    uint was;
-    results.InterlockedAdd(4, 1, was);
-    if (!same) {
-        uint before;
-        results.InterlockedAdd(0, 1, before);
-        if (before == 0) {
-            for (uint k = 0; k < min(words, 8u); k++) {
-                results.Store(8 + 4 * k, window_record.Load(4 * k));
-                results.Store(40 + 4 * k, fresh_record.Load(4 * k));
-            }
-        }
-    }
-    fresh_budget.Store3(0, uint3(0, 0, 0));
-}
-"#;
-
-fn compare() -> Option<&'static Clamp> {
-    static COMPARE: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
-    COMPARE
+/// The batched clamp's pipeline ([`batch`]).
+fn batch_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
         .get_or_init(|| {
-            let device = &host()?.device;
-            match make_from(device, CHECK_SOURCE) {
+            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, batch::SOURCE));
+            match made {
                 Ok(c) => Some(c),
                 Err(e) => {
-                    tracing::warn!(error = %e, "no window check");
+                    tracing::warn!(error = %e, "no batched argument clamp: records are clamped one at a time");
                     None
                 }
             }
@@ -820,147 +568,51 @@ fn compare() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-/// A list's buffers for [`window_check`]: the fresh clamps' records and
-/// budget (the card's memory), and the results (memory the CPU maps:
-/// records that differed, checks, then the first differing record as the
-/// window had it and as the fresh clamp made it, eight dwords each).
-pub(crate) struct WindowCheck {
-    args: ID3D12Resource,
-    budget: ID3D12Resource,
-    results: ID3D12Resource,
-    data: usize,
-}
-
-// SAFETY: D3D12 objects are free-threaded; the mapping is read only at
-// submission, when the list's last run has finished.
-unsafe impl Send for WindowCheck {}
-// SAFETY: as above.
-unsafe impl Sync for WindowCheck {}
-
-impl WindowCheck {
-    pub(crate) fn new() -> Option<WindowCheck> {
-        let host = host()?;
-        let (results, data) = host.shared_buffer(256)?;
-        // SAFETY: the mapping holds 256 bytes; nothing runs yet.
-        unsafe { std::ptr::write_bytes(data, 0, 256) };
-        Some(WindowCheck {
-            args: host.uav_buffer(64 << 10)?,
-            budget: host.uav_buffer(256)?,
-            results,
-            data: data as usize,
-        })
-    }
-
-    /// What the list's last run found, zeroed for the next: checks, records
-    /// that differed, and the first that did (as the window had it, as the
-    /// fresh clamp made it). Only between runs of the list.
-    pub(crate) fn take(&self) -> (u32, u32, [u32; 8], [u32; 8]) {
-        let words = self.data as *mut u32;
-        // SAFETY: the list's own mapped words; its last run has finished.
-        unsafe {
-            let at = |k: usize| words.add(k).read_volatile();
-            let window = std::array::from_fn(|k| at(2 + k));
-            let fresh = std::array::from_fn(|k| at(10 + k));
-            let found = (at(1), at(0), window, fresh);
-            std::ptr::write_bytes(words, 0, 18);
-            found
+/// Opens a batch in `list` ([`batch`]): a pass that clamps the records of
+/// the executions recorded after it, of `source` (a host copy's number and
+/// buffer) and of the `recent` ones after it. The table to add them to,
+/// and the scratch buffer its places are in. Replaces the list's compute
+/// root signature and pipeline (callers bind theirs after). `None` if the
+/// clamp is not available.
+pub(crate) fn open_batch(
+    list: &HostList,
+    source: (u64, &ID3D12Resource),
+    recent: &[(u64, ID3D12Resource)],
+) -> Option<(batch::Table, ID3D12Resource)> {
+    let c = batch_clamp()?;
+    let budget = list.budget()?;
+    let (jobs, at) = list.scratch(batch::TABLE)?;
+    let (dst, base, before) = list.batch_place()?;
+    let gpu = |b: &ID3D12Resource| {
+        // SAFETY: a live buffer.
+        Some(unsafe { b.GetGPUVirtualAddress() }).filter(|at| at.is_multiple_of(4))
+    };
+    // A source there is none of is the first again, which no job names.
+    let mut ids = [0u64; batch::SOURCES];
+    let mut sources = [gpu(source.1)?; batch::SOURCES];
+    ids[0] = source.0;
+    let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
+    for (i, (id, buffer)) in others.enumerate() {
+        if let Some(at) = gpu(buffer) {
+            // Bound, and read only if a job names it: kept alive like the
+            // copies draws read (`Shadow::refresh`).
+            list.keep(buffer);
+            (ids[i + 1], sources[i + 1]) = (*id, at);
         }
     }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    // SAFETY: the list's own upload memory of that many bytes, 256-byte
+    // aligned, until it is reset.
+    Some((unsafe { batch::Table::new(at, base, ids) }, dst))
 }
 
-/// Checks and differing records seen by [`window_check`] so far.
-static CHECKED: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-
-/// [`window_check`] for a draw served from a window: the record of `kind`
-/// at `src`, `step` bytes long, which the window clamped into `scratch` at
-/// `at`, is clamped again into the list's check buffer and compared. Runs
-/// compute work of ours, so the caller binds its pipeline again after it.
-/// False if nothing was recorded.
-pub(crate) fn check_hit(
-    list: &HostList,
-    src: (&ID3D12Resource, u64),
-    (kind, step): (u32, u32),
-    scratch: &ID3D12Resource,
-    at: u64,
-) -> bool {
-    const CHECK_USE: usize = usize::MAX - 0x78;
-    let (Some(c), Some(cmp), Some(check)) = (clamp(), compare(), list.window_check()) else {
-        return false;
-    };
-    if list.first_use(CHECK_USE) {
-        // At this recording's submission: what the list's last run found.
-        let data = check.data;
-        let words = WindowCheck {
-            args: check.args.clone(),
-            budget: check.budget.clone(),
-            results: check.results.clone(),
-            data,
-        };
-        list.defer_host(move || {
-            let (checked, differed, window, fresh) = words.take();
-            if checked == 0 {
-                return;
-            }
-            use std::sync::atomic::Ordering::Relaxed;
-            let total = CHECKED[0].fetch_add(u64::from(checked), Relaxed) + u64::from(checked);
-            let bad = CHECKED[1].fetch_add(u64::from(differed), Relaxed) + u64::from(differed);
-            if differed > 0 {
-                tracing::warn!(
-                    differed,
-                    checked,
-                    ?window,
-                    ?fresh,
-                    "window check: a draw served from a window read a record that \
-                     differs from a fresh clamp of it"
-                );
-            }
-            if total / 10_000 != (total - u64::from(checked)) / 10_000 {
-                tracing::info!(checked = total, differed = bad, "window check");
-            }
-        });
-    }
-    // SAFETY: live buffers.
-    let (budget, results, fresh, window) = unsafe {
-        (
-            check.budget.GetGPUVirtualAddress(),
-            check.results.GetGPUVirtualAddress(),
-            check.args.GetGPUVirtualAddress(),
-            scratch.GetGPUVirtualAddress() + at,
-        )
-    };
-    // The record again, by the window's rules, into the check's buffer
-    // (common before and after every check).
-    let common = D3D12_RESOURCE_STATE_COMMON;
-    let spec = (kind, step, 1);
-    if !record_clamp_as(c, &list.list, (&check.args, common), budget, src, None, spec, true) {
-        return false;
-    }
-    let args = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
-    let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    let words = step / 4;
-    // SAFETY: an open list; the compare's own root signature and pipeline;
-    // the scratch buffer is readable as arguments (and stays so), the
-    // check's buffer was left so by the clamp above.
-    unsafe {
-        list.list.ResourceBarrier(&[
-            transition(scratch, args, D3D12_RESOURCE_STATES(args.0 | read.0)),
-            transition(&check.args, args, read),
-        ]);
-        list.list.SetComputeRootSignature(&cmp.root);
-        list.list.SetPipelineState(&cmp.pso);
-        list.list.SetComputeRoot32BitConstants(0, 1, (&raw const words).cast(), 0);
-        list.list.SetComputeRootShaderResourceView(1, window);
-        list.list.SetComputeRootShaderResourceView(2, fresh);
-        list.list.SetComputeRootUnorderedAccessView(3, results);
-        list.list.SetComputeRootUnorderedAccessView(4, budget);
-        list.list.Dispatch(1, 1, 1);
-        list.list.ResourceBarrier(&[
-            transition(scratch, D3D12_RESOURCE_STATES(args.0 | read.0), args),
-            transition(&check.args, read, common),
-        ]);
-    }
-    true
+/// The batched clamp's root signature and pipeline on `device`, for the
+/// replayer.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn batch_for(device: &ID3D12Device) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+    make_from(device, batch::SOURCE).map(|c| (c.root, c.pso))
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -976,11 +628,11 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
@@ -1006,17 +658,40 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// Last, so given up last.
+        _turn: std::sync::MutexGuard<'static, ()>,
+    }
+
+    /// The software adapter is one test's at a time. Two tests that compile
+    /// and run shaders on it at once (it is one device for the process) make
+    /// `d3d10warp.dll` (10.0.26100) crash now and then: access violations in
+    /// its own shader compiler, on its own worker threads, in 12% of runs of
+    /// all tests and 3% of runs of these alone on two threads; none in 100
+    /// runs one after the other.
+    pub(crate) fn warp_turn() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TURN.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
-            // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
+            Self::on(true)
+        }
+
+        /// On the software adapter, or the first one (for measurements).
+        fn on(software: bool) -> Option<Self> {
+            let turn = warp_turn();
+            // SAFETY: plain DXGI query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+                let adapter: IDXGIAdapter = if software {
+                    factory.EnumWarpAdapter().ok()?
+                } else {
+                    factory.EnumAdapters(0).ok()?
+                };
                 let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                if software != (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
                     return None;
                 }
                 let mut device: Option<ID3D12Device> = None;
@@ -1048,6 +723,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _turn: turn,
                 })
             }
         }
@@ -1216,78 +892,10 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
-        // Both forms: a thread a piece, and a group a piece (the default).
-        card_compare_on_warp(crate::host::CARD_COMPARE, |pieces| pieces.div_ceil(64));
-        card_compare_on_warp(crate::host::CARD_COMPARE_WIDE, |pieces| pieces);
-    }
-
-    /// Every one-byte change is found, in the piece it is in, with a copy
-    /// that does not start on a piece boundary (`skew`) and a span that
-    /// does not start at piece 0: both forms of the compare.
-    #[test]
-    fn warp_card_compare_finds_every_byte_with_skew() {
-        for (source, groups) in [
-            (crate::host::CARD_COMPARE, (|p: u32| p.div_ceil(64)) as fn(u32) -> u32),
-            (crate::host::CARD_COMPARE_WIDE, |p| p),
-        ] {
-            let Some(mut warp) = WarpHarness::new() else {
-                return;
-            };
-            let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
-            const PIECE: usize = 64 << 10;
-            const SKEW: u32 = 0x3450;
-            const FIRST: u32 = 1;
-            const PIECES: u32 = 4;
-            let size = PIECE * 6;
-            let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
-            let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * 8);
-            let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
-            let content: Vec<u8> = (0..size).map(|i| (i * 131 + i / 7) as u8).collect();
-            // SAFETY: the mapping holds `size` bytes.
-            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
-            let run = |warp: &mut WarpHarness, mode: u32| -> Vec<u32> {
-                // SAFETY: as in `card_compare_on_warp`.
-                unsafe {
-                    for i in 0..PIECES as usize {
-                        differs_ptr.cast::<u32>().add(i).write_volatile(7);
-                    }
-                    warp.list.SetComputeRootSignature(&compare.root);
-                    warp.list.SetPipelineState(&compare.pso);
-                    let constants = [FIRST, SKEW, size as u32, PIECES, 0, mode];
-                    warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
-                    warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
-                    warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                    warp.list.Dispatch(groups(PIECES), 1, 1);
-                }
-                warp.submit_and_wait();
-                // SAFETY: as above.
-                (0..PIECES as usize).map(|i| unsafe { differs_ptr.cast::<u32>().add(i).read_volatile() }).collect()
-            };
-            run(&mut warp, 0);
-            assert_eq!(run(&mut warp, 1), vec![0; PIECES as usize]);
-            // Piece `FIRST + i` of the copy covers offsets [lo, hi) as the
-            // compare cuts them; a byte there changed flags that piece alone.
-            for (k, step) in [0usize, 1, 15, 16, 1023, 1024, 4095, 30001, 65535].iter().enumerate() {
-                let i = (k % PIECES as usize) as u32;
-                let lo = ((FIRST + i) as usize * PIECE).saturating_sub(SKEW as usize);
-                let at = lo + step % (PIECE - 16);
-                // SAFETY: inside the mapping.
-                unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x5a) };
-                let flagged = run(&mut warp, 1);
-                assert_eq!(flagged[i as usize], 1, "{source:.20}: byte {at:#x} of piece {i} not found");
-                // SAFETY: inside the mapping.
-                unsafe { now_ptr.add(at).write_volatile(content[at]) };
-                assert_eq!(run(&mut warp, 1), vec![0; PIECES as usize]);
-            }
-        }
-    }
-
-    fn card_compare_on_warp(source: &str, groups: fn(u32) -> u32) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -1313,11 +921,21 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(groups(PIECES), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
-            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+            let found = [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() });
+            if mode == 0 {
+                return found;
+            }
+            // Above the flag, the hash: as `host::torn` makes it of the bytes.
+            for (piece, d) in found.iter().enumerate() {
+                // SAFETY: inside the mapping, which the card has read.
+                let bytes = unsafe { std::slice::from_raw_parts(now_ptr.add(piece * PIECE).cast_const(), PIECE) };
+                assert_eq!(d >> 1, crate::host::piece_hash(bytes), "piece {piece}");
+            }
+            found.map(|d| d & 1)
         };
         let at = PIECE + 1234;
         // SAFETY (each): inside the mapping.
@@ -1343,105 +961,1100 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
-    /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
-    /// adapter, in one list behind the compare as `Host::card_before`
-    /// records it: each flagged piece takes a ticket and, while it is
-    /// within the slots of the lowest ticket in the air, its bytes go to
-    /// its slot; an unflagged piece's entry says so; a ticket past the
-    /// slots is written but copies nothing.
+    /// What the passes over copies in the card's memory cost on the card
+    /// (ignored: a measurement): rounds of a few passes of some pieces and a
+    /// wait, as a frame has them. `VICTORY_BENCH_CS=<file>` times another
+    /// source of the shader.
     #[test]
-    fn warp_card_fetch_copies_flagged_pieces_to_their_slots() {
-        use crate::host::{CARD_COMPARE, CARD_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT};
-        let Some(mut warp) = WarpHarness::new() else {
+    #[ignore]
+    fn card_compare_costs() {
+        let Some(mut gpu) = WarpHarness::on(false) else {
             return;
         };
-        let compare = compile_cs(&warp.device, CARD_COMPARE).expect("the card compare must compile on WARP");
-        let fetch = compile_cs(&warp.device, CARD_FETCH).expect("the card fetch must compile on WARP");
-        const PIECE: usize = 64 << 10;
-        const PIECES: u32 = 3;
-        // The copy starts 40 bytes into its piece 0: piece 0 is short, the
-        // others straddle title pieces and start off a multiple of 16.
-        const SKEW: u32 = 40;
-        let size = PIECE * PIECES as usize;
-        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
-        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES + 1));
-        let (_differs, _, differs_gpu) = warp.shared_buffer(64);
-        let (_table, table_ptr, table_gpu) = warp.shared_buffer(4 + 64);
-        let slots = 1u32;
-        let (_fetched, fetched_ptr, fetched_gpu) = warp.shared_buffer(INFLIGHT_SLOT * u64::from(slots));
-        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
-        // SAFETY: the mappings hold what is written.
-        unsafe {
-            std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size);
-            table_ptr.cast::<u32>().write_volatile(0);
+        let other = std::env::var("VICTORY_BENCH_CS").ok().map(|f| std::fs::read_to_string(f).unwrap());
+        let source: &'static str = other.map_or(crate::host::CARD_COMPARE, |s| Box::leak(s.into_boxed_str()));
+        let walked_alone = source.contains("SV_DispatchThreadID");
+        let compare = compile_cs(&gpu.device, source).expect("the compare must compile");
+        let now = gpu.default_uav(256 << 20);
+        let hashes = gpu.default_uav(64 << 10);
+        let differs = gpu.default_uav(64 << 10);
+        for (rounds, passes, pieces) in [(80u32, 5u32, 1u32), (80, 5, 5), (80, 5, 64), (80, 5, 500), (1, 1, 4000)] {
+            let mut best = f64::MAX;
+            for _ in 0..6 {
+                // SAFETY: our open list, live buffers, the compare's own
+                // root signature; the pieces lie in the buffers.
+                unsafe {
+                    gpu.list.SetComputeRootSignature(&compare.root);
+                    gpu.list.SetPipelineState(&compare.pso);
+                    gpu.list.SetComputeRootShaderResourceView(1, now.GetGPUVirtualAddress());
+                    gpu.list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                    gpu.list.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                    for _ in 0..rounds {
+                        for pass in 0..passes {
+                            let first = if pieces * passes < 4096 { pass * pieces } else { 0 };
+                            let constants = [first, 0u32, 256 << 20, pieces, 0, 1];
+                            gpu.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                            gpu.list.Dispatch(if walked_alone { pieces.div_ceil(64) } else { pieces }, 1, 1);
+                        }
+                        gpu.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                    pResource: std::mem::ManuallyDrop::new(None),
+                                }),
+                            },
+                            ..Default::default()
+                        }]);
+                    }
+                }
+                let t = std::time::Instant::now();
+                gpu.submit_and_wait();
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let mb = f64::from(rounds * passes * pieces) / 16.0;
+            println!("{rounds} rounds of {passes} passes of {pieces} pieces: {best:.2} ms ({mb:.0} MB, {:.0} GB/s)", mb / best / 1.024);
         }
-        let pieces = PIECES + 1;
-        let run = |warp: &mut WarpHarness, mode: u32, landed: u32| -> Vec<u32> {
-            // SAFETY: our open list, live buffers, the shaders' own root
-            // signatures; the mappings hold what is read and written.
+    }
+
+    /// What raw loads through views that are not raw give past the view's
+    /// end (ignored: a measurement of the card). A buffer view of 4 KiB in a
+    /// buffer of 1 MiB whose every dword says where it lies: zeros past the
+    /// view, or the bytes there (whatever the card has in that place).
+    #[test]
+    #[ignore]
+    fn raw_loads_past_views() {
+        let Some(mut gpu) = WarpHarness::on(std::env::var_os("VICTORY_BENCH_WARP").is_some()) else {
+            return;
+        };
+        const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4,b0), DescriptorTable(SRV(t0,numDescriptors=8)), UAV(u0), DescriptorTable(CBV(b1,numDescriptors=8))"
+cbuffer C : register(b0) { uint which; uint first; uint step; uint at; }
+ByteAddressBuffer v[8] : register(t0);
+struct Block { uint4 d[4096]; };
+ConstantBuffer<Block> c[8] : register(b1);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID, uint g : SV_GroupIndex) {
+    if (step == 0) { if (id.x == 0) o.Store(at, v[which].Load(first)); }
+    else if (step == 1) { if (id.x == 0) o.Store(at, c[which].d[first / 16][(first / 4) & 3]); }
+    else if (step == 16) { o.Store(at + id.x * 4, c[which].d[first / 16 + id.x][(first / 4) & 3]); }
+    else { o.Store(at + id.x * 4, v[which].Load(first + id.x * step)); }
+}
+"#;
+        let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
+        let (buffer, data, _) = gpu.shared_buffer(1 << 20);
+        for i in 0..(1usize << 18) {
+            // SAFETY: inside the mapping.
+            unsafe { data.cast::<u32>().add(i).write(0xA000_0000 | i as u32) };
+        }
+        let (_out, out_ptr, out_gpu) = gpu.shared_buffer(1 << 16);
+        // SAFETY: plain heap creation, views of a live buffer.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            gpu.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 16,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        }
+        .unwrap();
+        // SAFETY: as above.
+        let (cpu, table, step) = unsafe {
+            (
+                heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                heap.GetGPUDescriptorHandleForHeapStart(),
+                gpu.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
+            )
+        };
+        let names = ["raw", "structured 24 at 24", "structured 16", "typed u32", "typed u16", "typed 4 x u32", "constant buffer", "raw, moved to 8"];
+        let view = |i: usize, format: i32, first: u64, count: u32, stride: u32, raw: bool, null: bool| {
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT(format),
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: first,
+                        NumElements: count,
+                        StructureByteStride: stride,
+                        Flags: if raw { D3D12_BUFFER_SRV_FLAG_RAW } else { D3D12_BUFFER_SRV_FLAG_NONE },
+                    },
+                },
+            };
+            let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + i * step };
+            // SAFETY: a slot of our heap, a live buffer.
+            unsafe { gpu.device.CreateShaderResourceView(if null { None } else { Some(&buffer) }, Some(&desc), at) };
+        };
+        for base in [0, 8] {
+            view(base, 39, 0, 1024, 0, true, false);
+            view(base + 1, 0, 1, 170, 24, false, false);
+            view(base + 2, 0, 0, 256, 16, false, false);
+            view(base + 3, 42, 0, 1024, 0, false, false);
+            view(base + 4, 57, 0, 2048, 0, false, false);
+            view(base + 5, 3, 0, 256, 0, false, false);
+            // 1,024 dwords from 0 made in a heap the card does not see, moved
+            // on by 8 bytes (`descriptor::host::move_raw`), copied in.
+            // SAFETY: plain heap creation, slots of live heaps.
             unsafe {
-                warp.list.SetComputeRootSignature(&compare.root);
-                warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, SKEW, size as u32, pieces, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
-                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
-                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
-                if mode == 2 {
-                    warp.list.ResourceBarrier(&[uav_barrier()]);
-                    warp.list.SetComputeRootSignature(&fetch.root);
-                    warp.list.SetPipelineState(&fetch.pso);
-                    // Two groups for four pieces: the loop over pieces.
-                    let constants = [0u32, SKEW, size as u32, pieces, 0, landed, slots, 2];
-                    warp.list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
-                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
-                    warp.list.SetComputeRootUnorderedAccessView(2, differs_gpu);
-                    warp.list.SetComputeRootUnorderedAccessView(3, table_gpu);
-                    warp.list.SetComputeRootUnorderedAccessView(4, fetched_gpu);
-                    warp.list.Dispatch(2, 1, 1);
+                let beside: ID3D12DescriptorHeap = gpu
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 1,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let at = beside.GetCPUDescriptorHandleForHeapStart();
+                let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT(39),
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: 0,
+                            NumElements: 1024,
+                            StructureByteStride: 0,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        },
+                    },
+                };
+                gpu.device.CreateShaderResourceView(&buffer, Some(&desc), at);
+                let moved = crate::descriptor::host::move_raw(at, buffer.GetGPUVirtualAddress(), 4096, 8);
+                println!("the raw view was moved: {moved}");
+                gpu.device.CopyDescriptorsSimple(
+                    1,
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + (base + 7) * step },
+                    at,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+            }
+            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                // SAFETY: a live buffer.
+                BufferLocation: unsafe { buffer.GetGPUVirtualAddress() },
+                SizeInBytes: 4096,
+            };
+            // SAFETY: a slot of our heap.
+            unsafe { gpu.device.CreateConstantBufferView(Some(&desc), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + (base + 6) * step }) };
+        }
+        let table2 = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: table.ptr + 8 * step as u64 };
+        let offsets = [0u32, 4092, 4096, 4104, 8192, 65536, 524_288, (1 << 20) - 4];
+        for mode in ["one load (uniform)", "a load a thread", "constant buffer load", "Constant buffer load a thread"] {
+            println!("{mode}:");
+            for (which, name) in names.iter().enumerate() {
+                // SAFETY: our open list, live buffers.
+                unsafe {
+                    std::ptr::write_bytes(out_ptr, 0x77, 1 << 16);
+                    gpu.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                    gpu.list.SetComputeRootSignature(&pass.root);
+                    gpu.list.SetPipelineState(&pass.pso);
+                    gpu.list.SetComputeRootDescriptorTable(1, table);
+                    gpu.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+                    gpu.list.SetComputeRootDescriptorTable(3, table2);
+                    for (k, &offset) in offsets.iter().enumerate() {
+                        let step = match mode.as_bytes()[0] {
+                            b'o' => 0u32,
+                            b'c' => 1,
+                            b'C' => 16,
+                            _ => 4,
+                        };
+                        // (A thread's loads end at the offset.)
+                        let first = if step == 4 { offset.saturating_sub(63 * 4) } else { offset };
+                        let constants = [which as u32, first, step, k as u32 * 256];
+                        gpu.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                        gpu.list.Dispatch(1, 1, 1);
+                    }
+                }
+                gpu.submit_and_wait();
+                let found: Vec<String> = offsets
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &offset)| {
+                        let thread = if mode.as_bytes()[0] == b'a' { (offset.min(63 * 4) / 4) as usize } else { 0 };
+                        // SAFETY: inside the mapping.
+                        let word = unsafe { out_ptr.cast::<u32>().add(k * 64 + thread).read_volatile() };
+                        format!("{offset}: {word:#x}")
+                    })
+                    .collect();
+                println!("  {name:20} {}", found.join("  "));
+            }
+        }
+        // SAFETY: a plain query.
+        println!("device: {:?}", unsafe { gpu.device.GetDeviceRemovedReason() });
+    }
+
+    /// Whether the card can read a texture's descriptor half written
+    /// (ignored: a measurement of the card, `VICTORY_BENCH_S` seconds a way,
+    /// 5). Two slots change between a texture of 64x64 and one of 2048x2048
+    /// as fast as a thread can write them, while groups that each load the
+    /// descriptor anew ask its size and read its last texel: size and texel
+    /// of two textures are one descriptor half written. (Both lie in one heap
+    /// that is there as a whole: a read past the small one finds memory.)
+    #[test]
+    #[ignore]
+    fn descriptors_written_under_readers() {
+        let Some(mut gpu) = WarpHarness::on(std::env::var_os("VICTORY_BENCH_WARP").is_some()) else {
+            return;
+        };
+        let seconds = std::env::var("VICTORY_BENCH_S").ok().and_then(|v| v.parse().ok()).unwrap_or(5u64);
+        const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=1,b0), DescriptorTable(SRV(t0,numDescriptors=2,flags=DESCRIPTORS_VOLATILE)), UAV(u0)"
+cbuffer C : register(b0) { uint odd; }
+Texture2D<float4> t[2] : register(t0);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
+    uint w, h, n;
+    uint which = (g.x + odd) & 1;
+    t[which].GetDimensions(0, w, h, n);
+    uint r = (uint)(t[which].Load(int3(w - 1, h - 1, 0)).x * 255.0 + 0.5);
+    // 0: small, 1: large, 2: no size of the two, 3: small with another texel, 4: large with another
+    uint kind = (w == 64 && h == 64) ? (r == 17 ? 0 : 3) : (w == 2048 && h == 2048) ? (r == 34 ? 1 : 4) : 2;
+    if (i == 0) {
+        uint was;
+        o.InterlockedAdd(kind * 4, 1, was);
+        if (kind > 1) { o.Store(32, w); o.Store(36, h); o.Store(40, r); }
+    }
+}
+"#;
+        let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
+        let texture = |size: u64| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: size,
+            Height: size as u32,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(28),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        // SAFETY: plain creation; each texture in its own half of the heap.
+        let (heap, textures) = unsafe {
+            let mut heap: Option<ID3D12Heap> = None;
+            gpu.device
+                .CreateHeap(
+                    &D3D12_HEAP_DESC {
+                        SizeInBytes: 64 << 20,
+                        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                        Alignment: 0,
+                        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                    },
+                    &mut heap,
+                )
+                .unwrap();
+            let heap = heap.unwrap();
+            let textures = [(0u64, 64u64), (32 << 20, 2048)].map(|(at, size)| {
+                let mut made: Option<ID3D12Resource> = None;
+                gpu.device
+                    .CreatePlacedResource(&heap, at, &texture(size), D3D12_RESOURCE_STATE_COPY_DEST, None, &mut made)
+                    .unwrap();
+                made.unwrap()
+            });
+            (heap, textures)
+        };
+        // Fill them: 17 and 34 in every byte.
+        for (texture, (size, byte)) in textures.iter().zip([(64u32, 17u8), (2048, 34)]) {
+            let pitch = size * 4;
+            let (from, data, _) = gpu.shared_buffer(u64::from(pitch) * u64::from(size));
+            // SAFETY: the mapping holds the bytes; an open list, live resources.
+            unsafe {
+                std::ptr::write_bytes(data, byte, (pitch * size) as usize);
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&from),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT(28),
+                                Width: size,
+                                Height: size,
+                                Depth: 1,
+                                RowPitch: pitch,
+                            },
+                        },
+                    },
+                };
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                gpu.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                gpu.list.ResourceBarrier(&[crate::host::transition(
+                    texture,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+            gpu.submit_and_wait();
+        }
+        let view_heap = |visible: bool| -> ID3D12DescriptorHeap {
+            // SAFETY: plain heap creation.
+            unsafe {
+                gpu.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 4,
+                    Flags: if visible { D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE } else { D3D12_DESCRIPTOR_HEAP_FLAG_NONE },
+                    NodeMask: 0,
+                })
+            }
+            .unwrap()
+        };
+        let (shown, kept) = (view_heap(true), view_heap(false));
+        // SAFETY: live heaps.
+        let (to, from, step) = unsafe {
+            (
+                shown.GetCPUDescriptorHandleForHeapStart().ptr,
+                kept.GetCPUDescriptorHandleForHeapStart().ptr,
+                gpu.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
+            )
+        };
+        let at = |base: usize, i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + i * step };
+        for (i, texture) in textures.iter().enumerate() {
+            // SAFETY: slots of our heaps, live textures.
+            unsafe {
+                gpu.device.CreateShaderResourceView(texture, None, at(from, i));
+                gpu.device.CreateShaderResourceView(texture, None, at(to, i));
+            }
+        }
+        let bytes = |base: usize, i: usize| {
+            // SAFETY: a heap's handle; what it points at is read if it is memory.
+            let mut out = vec![0u8; step];
+            crate::host::read_into((base + i * step) as *const u8, &mut out).then_some(out)
+        };
+        println!("step {step}, the heaps' handles point at {:#x} and {:#x} (shown, kept)", to, from);
+        for i in 0..2 {
+            println!("  shown {i}: {:02x?}", bytes(to, i));
+            println!("  kept  {i}: {:02x?}", bytes(from, i));
+        }
+        let same = bytes(to, 0).is_some() && bytes(to, 0) == bytes(from, 0) && bytes(to, 1) == bytes(from, 1);
+        println!("the shown heap's memory is the descriptors' own bytes: {same}");
+        let images = [bytes(from, 0), bytes(from, 1)];
+        // SAFETY: a live heap.
+        let table = unsafe { shown.GetGPUDescriptorHandleForHeapStart() };
+        for way in ["view creation", "copies from a CPU heap", "one 32 byte store"] {
+            if way.starts_with("one") && !(same && step == 32) {
+                continue;
+            }
+            let (_out, out_ptr, out_gpu) = gpu.shared_buffer(1 << 12);
+            // SAFETY: the mapping.
+            unsafe { std::ptr::write_bytes(out_ptr, 0, 1 << 12) };
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let writes = std::sync::atomic::AtomicU64::new(0);
+            std::thread::scope(|scope| {
+                let device = gpu.device.clone();
+                let (stop, writes, textures, images) = (&stop, &writes, &textures, &images);
+                scope.spawn(move || {
+                    let mut k = 0usize;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        for slot in 0..2 {
+                            let which = (k + slot) & 1;
+                            // SAFETY: slots of our heaps, live textures.
+                            unsafe {
+                                match way.as_bytes()[0] {
+                                    b'v' => device.CreateShaderResourceView(&textures[which], None, at(to, slot)),
+                                    b'c' => device.CopyDescriptorsSimple(
+                                        1,
+                                        at(to, slot),
+                                        at(from, which),
+                                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                    ),
+                                    _ => store32(to + slot * step, images[which].as_deref().unwrap()),
+                                }
+                            }
+                        }
+                        k += 1;
+                        writes.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+                let started = std::time::Instant::now();
+                let mut odd = 0u32;
+                while started.elapsed().as_secs() < seconds {
+                    // SAFETY: our open list, live objects.
+                    unsafe {
+                        gpu.list.SetDescriptorHeaps(&[Some(shown.clone())]);
+                        gpu.list.SetComputeRootSignature(&pass.root);
+                        gpu.list.SetPipelineState(&pass.pso);
+                        gpu.list.SetComputeRootDescriptorTable(1, table);
+                        gpu.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+                        for _ in 0..8 {
+                            gpu.list.SetComputeRoot32BitConstants(0, 1, (&raw const odd).cast(), 0);
+                            gpu.list.Dispatch(65_535, 1, 1);
+                            odd += 1;
+                        }
+                    }
+                    gpu.submit_and_wait();
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            // SAFETY: the mapping, the card is done.
+            let found: Vec<u32> = (0..11).map(|i| unsafe { out_ptr.cast::<u32>().add(i).read_volatile() }).collect();
+            println!(
+                "{way}: {} writes; groups that saw the small texture {}, the large {}; no size of the two {}, the small size with another texel {}, the large size with another texel {}; the last such: {}x{} texel {}",
+                writes.load(std::sync::atomic::Ordering::Relaxed),
+                found[0],
+                found[1],
+                found[2],
+                found[3],
+                found[4],
+                found[8],
+                found[9],
+                found[10]
+            );
+            // SAFETY: a plain query.
+            println!("  device: {:?}", unsafe { gpu.device.GetDeviceRemovedReason() });
+        }
+        drop(heap);
+    }
+
+    /// 32 bytes to `to` (32 byte aligned) in one store, then a fence.
+    ///
+    /// # Safety
+    /// `to` is 32 bytes of memory that may be written.
+    unsafe fn store32(to: usize, bytes: &[u8]) {
+        #[target_feature(enable = "avx")]
+        unsafe fn store(to: usize, bytes: *const u8) {
+            use std::arch::x86_64::*;
+            // SAFETY: the caller's.
+            unsafe {
+                _mm256_stream_si256(to as *mut __m256i, _mm256_loadu_si256(bytes.cast()));
+                _mm_sfence();
+            }
+        }
+        assert!(std::is_x86_feature_detected!("avx") && bytes.len() == 32 && to.is_multiple_of(32));
+        // SAFETY: asked for above; the caller's memory.
+        unsafe { store(to, bytes.as_ptr()) }
+    }
+
+    /// What a texture read in another dimension than its view's gives
+    /// (ignored: a measurement of the card): a view of a small 2D texture
+    /// read as an array, a volume and a cube, and a small volume read as 2D,
+    /// far out. The texture lies at the start of a heap whose other megabytes
+    /// hold other bytes: a texel of those is a read past the texture.
+    #[test]
+    #[ignore]
+    fn textures_read_in_another_dimension() {
+        let Some(mut gpu) = WarpHarness::on(std::env::var_os("VICTORY_BENCH_WARP").is_some()) else {
+            return;
+        };
+        const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=2,b0), DescriptorTable(SRV(t0,numDescriptors=4,flags=DESCRIPTORS_VOLATILE)), UAV(u0), StaticSampler(s0,filter=FILTER_MIN_MAG_MIP_POINT,addressU=TEXTURE_ADDRESS_WRAP,addressV=TEXTURE_ADDRESS_WRAP,addressW=TEXTURE_ADDRESS_WRAP)"
+cbuffer C : register(b0) { uint how; uint far; }
+Texture2D<float4> flat_ : register(t0);
+Texture2DArray<float4> layers : register(t1);
+Texture3D<float4> volume : register(t2);
+TextureCubeArray<float4> cube : register(t3);
+SamplerState s : register(s0);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 t : SV_DispatchThreadID) {
+    uint2 at = uint2(t.x & 7, t.x >> 3);
+    float4 c = 0;
+    if (how == 0) c = flat_.Load(int3(at, 0));
+    if (how == 1) c = layers.Load(int4(at, far, 0));
+    if (how == 2) c = volume.Load(int4(at, far, 0));
+    if (how == 3) c = layers.SampleLevel(s, float3((at + 0.5) / 64, far), 0);
+    if (how == 4) c = volume.SampleLevel(s, float3((at + 0.5) / 64, (far + 0.5) / 4096.0), 0);
+    if (how == 5) c = cube.SampleLevel(s, float4(1, (at + 0.5) / 64, far), 0);
+    if (how == 6) c = flat_.Load(int3(at, far));
+    uint r = (uint)(c.x * 255.0 + 0.5), was;
+    // the texture's own bytes, zeros, anything else
+    o.InterlockedAdd(r == 17 ? 0 : r == 0 ? 4 : 8, 1, was);
+    if (r != 17 && r != 0) o.Store(12, r);
+}
+"#;
+        let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
+        // SAFETY: plain creation, each thing in its own part of the heap.
+        let (_heap, small) = unsafe {
+            let mut heap: Option<ID3D12Heap> = None;
+            gpu.device
+                .CreateHeap(
+                    &D3D12_HEAP_DESC {
+                        SizeInBytes: 256 << 20,
+                        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                        Alignment: 0,
+                        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                    },
+                    &mut heap,
+                )
+                .unwrap();
+            let heap = heap.unwrap();
+            let place = |at: u64, size: u64| {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: size,
+                    Height: size as u32,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT(28),
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                };
+                let mut made: Option<ID3D12Resource> = None;
+                gpu.device
+                    .CreatePlacedResource(&heap, at, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut made)
+                    .unwrap();
+                made.unwrap()
+            };
+            let small = place(0, 64);
+            // The rest: 34 in every byte.
+            let mut fill: Vec<(ID3D12Resource, u32, u8)> = vec![(small.clone(), 64, 17)];
+            for k in 0..15u64 {
+                fill.push((place((1 + k) << 24, 2048), 2048, 34));
+            }
+            for k in 1..16u64 {
+                fill.push((place(k << 20, 512), 512, 34));
+            }
+            for (texture, size, byte) in fill {
+                let pitch = size * 4;
+                let (from, data, _) = gpu.shared_buffer(u64::from(pitch) * u64::from(size));
+                std::ptr::write_bytes(data, byte, (pitch * size) as usize);
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&from),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT(28),
+                                Width: size,
+                                Height: size,
+                                Depth: 1,
+                                RowPitch: pitch,
+                            },
+                        },
+                    },
+                };
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                gpu.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                gpu.list.ResourceBarrier(&[crate::host::transition(
+                    &texture,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+                gpu.submit_and_wait();
+            }
+            (heap, small)
+        };
+        // SAFETY: plain heap creation; slots of it, a live texture.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            let heap: ID3D12DescriptorHeap = gpu
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 4,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step = gpu.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            for i in 0..4 {
+                let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: heap.GetCPUDescriptorHandleForHeapStart().ptr + i * step };
+                // A 2D view of the small texture in every slot.
+                gpu.device.CreateShaderResourceView(&small, None, at);
+            }
+            heap
+        };
+        for (how, name) in
+            ["2D", "array, loaded", "volume, loaded", "array, sampled", "volume, sampled", "cube array", "2D, a level it has not"]
+                .iter()
+                .enumerate()
+        {
+            for far in [0u32, 1, 7, 63, 1000, 4000] {
+                let (_out, out_ptr, out_gpu) = gpu.shared_buffer(1 << 12);
+                // SAFETY: the mapping; our open list, live objects.
+                unsafe {
+                    std::ptr::write_bytes(out_ptr, 0, 1 << 12);
+                    gpu.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                    gpu.list.SetComputeRootSignature(&pass.root);
+                    gpu.list.SetPipelineState(&pass.pso);
+                    gpu.list.SetComputeRoot32BitConstants(0, 2, [how as u32, far].as_ptr().cast(), 0);
+                    gpu.list.SetComputeRootDescriptorTable(1, heap.GetGPUDescriptorHandleForHeapStart());
+                    gpu.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+                    gpu.list.Dispatch(1, 1, 1);
+                }
+                gpu.submit_and_wait();
+                // SAFETY: the mapping, the card is done.
+                let found: Vec<u32> = (0..4).map(|i| unsafe { out_ptr.cast::<u32>().add(i).read_volatile() }).collect();
+                println!("{name} at {far}: its own texels {}, zeros {}, others {} (the last {})", found[0], found[1], found[2], found[3]);
+            }
+        }
+        // SAFETY: a plain query.
+        println!("device: {:?}", unsafe { gpu.device.GetDeviceRemovedReason() });
+    }
+
+    /// Loads far outside their views (ignored: it may lose the device, and
+    /// says which way did): raw, typed, constant and texture loads at the
+    /// ends of 32 bits, uniform and per lane, and samples at coordinates,
+    /// levels and gradients that are no numbers. Each way is a submission of
+    /// its own.
+    #[test]
+    #[ignore]
+    fn loads_far_outside_views() {
+        let Some(mut gpu) = WarpHarness::on(std::env::var_os("VICTORY_BENCH_WARP").is_some()) else {
+            return;
+        };
+        const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4,b0), DescriptorTable(SRV(t0,numDescriptors=4),CBV(b1)), UAV(u0), StaticSampler(s0,filter=FILTER_MIN_MAG_MIP_LINEAR,addressU=TEXTURE_ADDRESS_WRAP,addressV=TEXTURE_ADDRESS_WRAP)"
+cbuffer C : register(b0) { uint how; uint far; uint lane; uint out_at; }
+ByteAddressBuffer raw : register(t0);
+Buffer<float4> typed : register(t1);
+Texture2D<float4> tex : register(t2);
+struct Block { uint4 d[4096]; };
+ConstantBuffer<Block> block : register(b1);
+SamplerState s : register(s0);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 t : SV_DispatchThreadID) {
+    uint at = far + t.x * lane * 4;
+    float4 c = 0;
+    if (how == 0) c = asfloat(raw.Load4(at));
+    if (how == 1) c = asfloat(raw.Load(at + 4092));
+    if (how == 2) c = typed.Load(at);
+    if (how == 3) c = asfloat(block.d[at]);
+    if (how == 4) c = tex.Load(int3(at, 0, 0));
+    if (how == 5) c = tex.Load(int3(0, 0, at));
+    if (how == 6) c = tex.SampleLevel(s, asfloat(uint2(at, at)), 0);
+    if (how == 7) c = tex.SampleLevel(s, float2(0.5, 0.5), asfloat(at));
+    if (how == 8) c = tex.SampleGrad(s, float2(0.5, 0.5), asfloat(at).xx, asfloat(at).xx);
+    uint was;
+    o.InterlockedAdd(any(asuint(c) != 0) ? 4 : 0, 1, was);
+}
+"#;
+        let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
+        let (buffer, data, gpu_at) = gpu.shared_buffer(1 << 16);
+        // SAFETY: the mapping.
+        unsafe { std::ptr::write_bytes(data, 0x3f, 1 << 16) };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 7,
+            Format: DXGI_FORMAT(28),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        // SAFETY: plain creation; slots of our heap, live objects.
+        let (_texture, heap) = unsafe {
+            let mut made: Option<ID3D12Resource> = None;
+            gpu.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    None,
+                    &mut made,
+                )
+                .unwrap();
+            let texture = made.unwrap();
+            let heap: ID3D12DescriptorHeap = gpu
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 5,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step = gpu.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let at = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: heap.GetCPUDescriptorHandleForHeapStart().ptr + i * step };
+            for (i, format, count, flags) in
+                [(0, 39, 1024, D3D12_BUFFER_SRV_FLAG_RAW), (1, 2, 256, D3D12_BUFFER_SRV_FLAG_NONE)]
+            {
+                let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT(format),
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV { FirstElement: 0, NumElements: count, StructureByteStride: 0, Flags: flags },
+                    },
+                };
+                gpu.device.CreateShaderResourceView(&buffer, Some(&view), at(i));
+            }
+            gpu.device.CreateShaderResourceView(&texture, None, at(2));
+            gpu.device.CreateShaderResourceView(&texture, None, at(3));
+            gpu.device.CreateConstantBufferView(
+                Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: gpu_at, SizeInBytes: 4096 }),
+                at(4),
+            );
+            (texture, heap)
+        };
+        let names = [
+            "raw, 4 dwords",
+            "raw, offset added",
+            "typed",
+            "constant buffer",
+            "texel",
+            "level of a texel",
+            "sample",
+            "level of a sample",
+            "gradients of a sample",
+        ];
+        for (how, name) in names.iter().enumerate() {
+            for far in [
+                0u32,
+                0x1000,
+                0x7fff_fff0,
+                0x8000_0000,
+                0xffff_f000,
+                0xffff_fff0,
+                0xffff_fffc,
+                0x7fc0_0000,
+                0x7f80_0000,
+                0xff80_0000,
+                0x7f7f_ffff,
+            ] {
+                for lane in [0u32, 1] {
+                    let (_out, out_ptr, out_gpu) = gpu.shared_buffer(1 << 12);
+                    // SAFETY: the mapping; our open list, live objects.
+                    unsafe {
+                        std::ptr::write_bytes(out_ptr, 0, 1 << 12);
+                        gpu.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                        gpu.list.SetComputeRootSignature(&pass.root);
+                        gpu.list.SetPipelineState(&pass.pso);
+                        gpu.list.SetComputeRoot32BitConstants(0, 4, [how as u32, far, lane, 0].as_ptr().cast(), 0);
+                        gpu.list.SetComputeRootDescriptorTable(1, heap.GetGPUDescriptorHandleForHeapStart());
+                        gpu.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+                        gpu.list.Dispatch(1, 1, 1);
+                        // (Not `submit_and_wait`, which expects to go on.)
+                        gpu.list.Close().unwrap();
+                        gpu.submitted += 1;
+                        let cmd: ID3D12CommandList = gpu.list.cast().unwrap();
+                        gpu.queue.ExecuteCommandLists(&[Some(cmd)]);
+                        let _ = gpu.queue.Signal(&gpu.fence, gpu.submitted);
+                        let _ = gpu.fence.SetEventOnCompletion(gpu.submitted, gpu.event);
+                        WaitForSingleObject(gpu.event, 8_000);
+                    }
+                    // SAFETY: the mapping; plain queries.
+                    let (zeros, others, device) = unsafe {
+                        (
+                            out_ptr.cast::<u32>().read_volatile(),
+                            out_ptr.cast::<u32>().add(1).read_volatile(),
+                            gpu.device.GetDeviceRemovedReason(),
+                        )
+                    };
+                    println!(
+                        "{name} at {far:#x}, lanes {lane}: zeros {zeros}, others {others}{}",
+                        if device.is_ok() { "" } else { " DEVICE LOST" }
+                    );
+                    if device.is_err() {
+                        return;
+                    }
+                    // SAFETY: the card is done with them.
+                    unsafe {
+                        gpu.allocator.Reset().unwrap();
+                        gpu.list.Reset(&gpu.allocator, None).unwrap();
+                    }
                 }
             }
-            warp.submit_and_wait();
-            // SAFETY: as above.
-            (0..=pieces as usize).map(|i| unsafe { table_ptr.cast::<u32>().add(i).read_volatile() }).collect()
+        }
+    }
+
+    /// Whether lists on the card may read a texture of a block made after
+    /// they were sent, through a slot they read by index (ignored: a
+    /// measurement that loses the device, so each way runs in a process of
+    /// its own; `VICTORY_BENCH_S` seconds a way, 30; `VICTORY_BENCH_N` runs of
+    /// each, 3). Threads (`VICTORY_BENCH_THREADS`, 4) make blocks of 64 MiB, a texture in each and its
+    /// view, and copies the view into a slot; long dispatches that read all
+    /// the slots are always on the card.
+    #[test]
+    #[ignore]
+    fn new_blocks_under_readers() {
+        if let Ok(way) = std::env::var("VICTORY_BLOCK_WAY") {
+            return new_blocks(&way);
+        }
+        let times: u32 = std::env::var("VICTORY_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        let seconds = std::env::var("VICTORY_BENCH_S").unwrap_or_else(|_| "30".into());
+        // "never": never resident, what must lose the device. "fresh-": no
+        // block goes (280 of them, 18 GB), so each has addresses no block had.
+        for way in ["fresh-made", "fresh-waited", "fresh-enqueued", "made", "waited", "enqueued", "never"] {
+            let fresh = way.starts_with("fresh-");
+            for n in 0..if way == "never" { 1 } else if fresh { times * 5 } else { times } {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["indirect::tests::new_blocks_under_readers", "--exact", "--ignored", "--nocapture"])
+                    .env("VICTORY_BLOCK_WAY", way)
+                    .env("VICTORY_BENCH_S", if fresh { "3" } else { &seconds })
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                let said = |what: &str| text.lines().find(|l| l.contains(what)).unwrap_or("(nothing said)").trim().to_owned();
+                println!("{way}, run {n}: {}; {} (exit {:?})", said("dispatches a"), said("blocks,"), out.status.code());
+            }
+        }
+    }
+
+    fn new_blocks(way: &str) {
+        let Some(gpu) = WarpHarness::on(false) else {
+            println!("no card: 0 blocks,");
+            return;
         };
-        // SAFETY (each): inside the mapping of the copy.
-        let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
-        // SAFETY (each): the slot's mapping holds `INFLIGHT_SLOT` bytes.
-        let slot = |len: usize| unsafe { std::slice::from_raw_parts(fetched_ptr, len).to_vec() };
-        run(&mut warp, 0, 0);
-        // Piece 2 of the copy (title piece 2: bytes 2 * 64 KiB - 40 on), its
-        // slot from the multiple of 16 below to the one above its end.
-        let from = 2 * PIECE - SKEW as usize;
-        let widened = from & !15;
-        assert_ne!(widened, from);
-        set(from + 100, content[from + 100] ^ 0x40);
-        let table = run(&mut warp, 2, 0);
-        assert_eq!(table, [1, INFLIGHT_NONE, INFLIGHT_NONE, 0, INFLIGHT_NONE]);
-        let mut wanted = content[widened..widened + INFLIGHT_SLOT as usize].to_vec();
-        wanted[from + 100 - widened] ^= 0x40;
-        assert_eq!(slot(INFLIGHT_SLOT as usize), wanted, "piece 2 in slot 0");
-        // Two pieces flagged with one slot, ticket 0 not landed: tickets 1
-        // and 2 get none and the slot keeps what it held.
-        set(5, content[5] ^ 1);
-        set(PIECE + 7, content[PIECE + 7] ^ 1);
-        let table = run(&mut warp, 2, 0);
-        assert_eq!(table[0], 3);
-        let mut tickets = [table[1], table[2]];
-        tickets.sort_unstable();
-        assert_eq!(tickets, [1, 2]);
-        assert_eq!(&table[3..], [INFLIGHT_NONE, INFLIGHT_NONE]);
-        assert_eq!(slot(INFLIGHT_SLOT as usize), wanted);
-        // Every ticket up to 2 landed: the next one, 3, gets slot 0. Piece
-        // 0 starts at the copy's start.
-        set(9, content[9] ^ 2);
-        let table = run(&mut warp, 2, 3);
-        assert_eq!(table, [4, 3, INFLIGHT_NONE, INFLIGHT_NONE, INFLIGHT_NONE]);
-        let mut piece0 = content[..PIECE - SKEW as usize].to_vec();
-        piece0[5] ^= 1;
-        piece0[9] ^= 2;
-        assert_eq!(slot(PIECE - SKEW as usize), piece0);
+        let (way, fresh) = match way.strip_prefix("fresh-") {
+            Some(way) => (way, true),
+            None => (way, false),
+        };
+        const SLOTS: usize = 64;
+        const BLOCK: u64 = 64 << 20;
+        let seconds = std::env::var("VICTORY_BENCH_S").ok().and_then(|v| v.parse().ok()).unwrap_or(30u64);
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0,numDescriptors=64,flags=DESCRIPTORS_VOLATILE|DATA_VOLATILE)), UAV(u0)"
+Texture2D<float4> t[64] : register(t0);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
+    uint which = g.x & 63;
+    float4 c = 0;
+    for (uint k = 0; k < 8; k++)
+        c += t[(which + k * 8) & 63].Load(int3((i + k * 13) & 127, (g.y + k * 29) & 255, 0));
+    if (c.x < -1) o.Store(0, 1);
+}
+"#;
+        let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
+        // SAFETY: plain heap creation.
+        let heap = |visible: bool, n: u32| -> ID3D12DescriptorHeap {
+            unsafe {
+                gpu.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: n,
+                    Flags: if visible { D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE } else { D3D12_DESCRIPTOR_HEAP_FLAG_NONE },
+                    NodeMask: 0,
+                })
+            }
+            .unwrap()
+        };
+        let (shown, beside) = (heap(true, SLOTS as u32), heap(false, 65));
+        // SAFETY: live heaps.
+        let (to, from, step) = unsafe {
+            (
+                shown.GetCPUDescriptorHandleForHeapStart().ptr,
+                beside.GetCPUDescriptorHandleForHeapStart().ptr,
+                gpu.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
+            )
+        };
+        let null = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT(28),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+            },
+        };
+        let slot = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: to + i * step };
+        let own = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: from + i * step };
+        // SAFETY: slots of our heaps.
+        unsafe {
+            gpu.device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&null), own(0));
+            for i in 0..SLOTS {
+                gpu.device.CopyDescriptorsSimple(1, slot(i), own(0), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            }
+        }
+        let (_out, _, out_gpu) = gpu.shared_buffer(1 << 12);
+        // SAFETY: a live heap.
+        let table = unsafe { shown.GetGPUDescriptorHandleForHeapStart() };
+        let list = |dispatches: u32| -> (ID3D12CommandAllocator, ID3D12GraphicsCommandList) {
+            // SAFETY: plain creation and recording.
+            unsafe {
+                let allocator: ID3D12CommandAllocator =
+                    gpu.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList =
+                    gpu.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                list.SetDescriptorHeaps(&[Some(shown.clone())]);
+                list.SetComputeRootSignature(&pass.root);
+                list.SetPipelineState(&pass.pso);
+                list.SetComputeRootDescriptorTable(0, table);
+                list.SetComputeRootUnorderedAccessView(1, out_gpu);
+                for _ in 0..dispatches {
+                    list.Dispatch(1024, 64, 1);
+                }
+                list.Close().unwrap();
+                (allocator, list)
+            }
+        };
+        // Lists of some 5 ms, always five sent: some run while a slot changes.
+        let mut sent = 0u64;
+        let mut dispatches = 8;
+        let ms = loop {
+            let one = list(dispatches);
+            let began = std::time::Instant::now();
+            // SAFETY: a closed list of ours; waited for.
+            unsafe {
+                gpu.queue.ExecuteCommandLists(&[Some(one.1.cast().unwrap())]);
+                sent += 1;
+                gpu.queue.Signal(&gpu.fence, sent).unwrap();
+                let _ = gpu.fence.SetEventOnCompletion(sent, gpu.event);
+                WaitForSingleObject(gpu.event, 10_000);
+            }
+            let ms = began.elapsed().as_secs_f64() * 1e3;
+            if ms >= 4.0 || dispatches >= 1 << 14 {
+                break ms;
+            }
+            dispatches *= 2;
+        };
+        println!("{dispatches} dispatches a list, {ms:.1} ms each");
+        let lists: Vec<_> = (0..6).map(|_| list(dispatches)).collect();
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+        let sent = AtomicU64::new(sent);
+        let stop = AtomicBool::new(false);
+        // Blocks; microseconds making a block, the longest; waiting, the longest.
+        let counts: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+        let threads: usize = std::env::var("VICTORY_BENCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let started = std::time::Instant::now();
+        let lost = std::thread::scope(|scope| {
+            for thread in 0..threads {
+                let (device, fence) = (gpu.device.clone(), gpu.fence.clone());
+                let (sent, stop, counts) = (&sent, &stop, &counts);
+                scope.spawn(move || {
+                    // Slots of its own, and a staged view of its own.
+                    let mine = SLOTS / threads;
+                    let slot = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: to + (thread * mine + i) * step };
+                    let own = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: from + i * step };
+                    let wait = way != "made";
+                    let mut alive: Vec<(ID3D12Heap, ID3D12Resource)> = Vec::new();
+                    let mut n = 0u64;
+                    while !stop.load(SeqCst) {
+                        // SAFETY: plain creation; slots of our heaps, this thread's.
+                        unsafe {
+                            let mut block: Option<ID3D12Heap> = None;
+                            let flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES
+                                | if wait { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE };
+                            let heap = D3D12_HEAP_DESC {
+                                SizeInBytes: BLOCK,
+                                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                                Alignment: 0,
+                                Flags: flags,
+                            };
+                            let began = std::time::Instant::now();
+                            if device.CreateHeap(&heap, &mut block).is_err() {
+                                break;
+                            }
+                            let us = began.elapsed().as_micros() as u64;
+                            counts[1].fetch_add(us, SeqCst);
+                            counts[2].fetch_max(us, SeqCst);
+                            let block = block.unwrap();
+                            let pageable: ID3D12Pageable = block.cast().unwrap();
+                            let began = std::time::Instant::now();
+                            if way == "waited" && device.MakeResident(&[Some(pageable.clone())]).is_err() {
+                                break;
+                            }
+                            if way == "enqueued" {
+                                let device: ID3D12Device3 = device.cast().unwrap();
+                                let paged: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                                let asked =
+                                    device.EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, &[Some(pageable)], &paged, 1);
+                                if asked.is_err() {
+                                    break;
+                                }
+                                while paged.GetCompletedValue() < 1 {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                            let us = began.elapsed().as_micros() as u64;
+                            counts[3].fetch_add(us, SeqCst);
+                            counts[4].fetch_max(us, SeqCst);
+                            let desc = D3D12_RESOURCE_DESC {
+                                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                                Width: 128,
+                                Height: 256,
+                                DepthOrArraySize: 1,
+                                MipLevels: 1,
+                                Format: DXGI_FORMAT(28),
+                                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                                ..Default::default()
+                            };
+                            let mut texture: Option<ID3D12Resource> = None;
+                            // Somewhere in the block, as the pool's pieces are.
+                            let at = (n * 7 % 900) << 16;
+                            if device
+                                .CreatePlacedResource(&block, at, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture)
+                                .is_err()
+                            {
+                                break;
+                            }
+                            let texture = texture.unwrap();
+                            let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+                            device.CreateShaderResourceView(&texture, None, own(1 + thread));
+                            device.CopyDescriptorsSimple(1, slot(n as usize % mine), own(1 + thread), kind);
+                            alive.push((block, texture));
+                            n += 1;
+                            counts[0].fetch_add(1, SeqCst);
+                            if fresh {
+                                if alive.len() >= 280 / threads {
+                                    break;
+                                }
+                            } else if alive.len() >= 24 {
+                                // Nothing shows or reads them any more when they go.
+                                for i in 0..mine {
+                                    device.CopyDescriptorsSimple(1, slot(i), own(0), kind);
+                                }
+                                let until = sent.load(SeqCst) + 1;
+                                while fence.GetCompletedValue() < until && !stop.load(SeqCst) {
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                                if fence.GetCompletedValue() < until {
+                                    break;
+                                }
+                                alive.clear();
+                            }
+                        }
+                    }
+                    // The lists sent last may read them: the process goes next.
+                    std::mem::forget(alive);
+                });
+            }
+            let lost = loop {
+                // SAFETY: closed lists of ours, each run again only when it has run.
+                unsafe {
+                    let done = gpu.fence.GetCompletedValue();
+                    if done == u64::MAX || gpu.device.GetDeviceRemovedReason().is_err() {
+                        break true;
+                    }
+                    while sent.load(SeqCst) < done + 5 {
+                        let n = sent.load(SeqCst);
+                        let list: ID3D12CommandList = lists[(n % 6) as usize].1.cast().unwrap();
+                        gpu.queue.ExecuteCommandLists(&[Some(list)]);
+                        let _ = gpu.queue.Signal(&gpu.fence, n + 1);
+                        sent.store(n + 1, SeqCst);
+                    }
+                }
+                if started.elapsed().as_secs() >= seconds {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(300));
+            };
+            stop.store(true, SeqCst);
+            lost
+        });
+        let sent = sent.into_inner();
+        let counts = counts.map(|c| c.into_inner());
+        let blocks = counts[0];
+        // SAFETY: a plain query.
+        let reason = unsafe { gpu.device.GetDeviceRemovedReason() };
+        println!(
+            "{blocks} blocks, {sent} lists in {:.1} s; making {:.0} us a block, the longest {}; waiting {:.0} us, the longest {}; {}",
+            started.elapsed().as_secs_f64(),
+            counts[1] as f64 / blocks.max(1) as f64,
+            counts[2],
+            counts[3] as f64 / blocks.max(1) as f64,
+            counts[4],
+            if lost { format!("LOST: {reason:?}") } else { "the device lives".to_owned() }
+        );
+        if !lost {
+            // SAFETY: waits for what was sent.
+            unsafe {
+                let _ = gpu.fence.SetEventOnCompletion(sent, gpu.event);
+                WaitForSingleObject(gpu.event, 10_000);
+            }
+        }
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
@@ -1522,11 +2135,11 @@ void main() {
             1,
             [5, 1, 1, 0x7777_8888, 0x9999_AAAA, 0xBBBB_CCCC],
         );
-        // Record 2 exceeds 65,535 in X -> clamped to (65535, 1, 1).
+        // Record 2 exceeds what any card runs in X -> clamped to (65535, 1, 1).
         write_record(
             &mut initial_src,
             2,
-            [100_000, 1, 1, 0xDDDD_EEEE, 0xFFFF_0001, 0x0123_4567],
+            [(1 << 20) + 1, 1, 1, 0xDDDD_EEEE, 0xFFFF_0001, 0x0123_4567],
         );
         for slot in 3..MAX as usize {
             // Each garbage slot would clamp to 65535 * 16 * 1 = 1,048,560 groups
@@ -1683,188 +2296,15 @@ void main() {
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
     }
 
-    #[test]
-    fn warp_single_record_matches_the_group_clamp() {
-        let Some(mut warp) = WarpHarness::new() else {
-            return;
-        };
-        let single = make_single(&warp.device).expect("single-record clamp must compile on WARP");
-        const STRIDE: u32 = 32;
-        const BUDGET: u32 = 1 << 27;
-        // Include padding, a nonzero source/count offset, and both sides of
-        // exact budget exhaustion. A zero count must leave scratch untouched.
-        let cases = [
-            (0, [3, 2, 17], None, 0, false),
-            (1, [9, 4, u32::MAX], Some(3), BUDGET - 36, false),
-            (1, [9, 4, u32::MAX], None, BUDGET - 35, false),
-            (2, [u32::MAX, 32, 1], Some(1), 0, false),
-            (2, [7, 1, 1], Some(0), 42, false),
-            (10, [u32::MAX, 5, 2], None, 0, false),
-            (10, [u32::MAX, 5, 2], None, 0, true),
-            (10, [0, 1, 1], None, BUDGET, false),
-            (10, [1, 1, 1], None, BUDGET, false),
-        ];
-        let (src, src_ptr, _) = warp.shared_buffer(64);
-        let (count, count_ptr, _) = warp.shared_buffer(8);
-        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
-        let (back, back_ptr, _) = warp.shared_buffer(u64::from(STRIDE));
-        let group = Clamp { root: warp.clamp.root.clone(), pso: warp.clamp.pso.clone() };
-        for (kind, args, count_value, spent, ahead) in cases {
-            let mut outcomes = Vec::new();
-            for clamp in [&group, &single] {
-                let dst = warp.default_uav(u64::from(STRIDE));
-                let record = [args[0], args[1], args[2], 4, 5, 6, 7, 8];
-                // SAFETY: CPU writes to mapped buffers after the previous
-                // submission completed. The full record starts at byte 32.
-                unsafe {
-                    src_ptr.add(32).cast::<[u32; 8]>().write(record);
-                    count_ptr.add(4).cast::<u32>().write(count_value.unwrap_or(0));
-                    budget_ptr.cast::<[u32; 3]>().write([spent, 17, 19]);
-                    warp.list.ResourceBarrier(&[transition(
-                        &dst,
-                        D3D12_RESOURCE_STATE_COMMON,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    )]);
-                    warp.list.CopyBufferRegion(&dst, 0, &src, 32, u64::from(STRIDE));
-                }
-                assert!(record_clamp_as(
-                    clamp,
-                    &warp.list,
-                    (&dst, D3D12_RESOURCE_STATE_COPY_DEST),
-                    budget_gpu,
-                    (&src, 32),
-                    count_value.map(|_| (&count, 4)),
-                    (kind, STRIDE, 1),
-                    ahead,
-                ));
-                // SAFETY: an open list, and the clamp left dst in INDIRECT_ARGUMENT.
-                unsafe {
-                    warp.list.ResourceBarrier(&[transition(
-                        &dst,
-                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    )]);
-                    warp.list.CopyBufferRegion(&back, 0, &dst, 0, u64::from(STRIDE));
-                }
-                warp.submit_and_wait();
-                // SAFETY: the submission ended, and both buffers remain mapped.
-                let outcome = unsafe {
-                    (
-                        budget_ptr.cast::<[u32; 3]>().read(),
-                        back_ptr.cast::<[u32; 8]>().read(),
-                    )
-                };
-                if count_value == Some(0) {
-                    assert_eq!(outcome, ([spent, 17, 19], record));
-                }
-                outcomes.push(outcome);
-            }
-            assert_eq!(outcomes[0], outcomes[1], "{kind} {args:?} {count_value:?} {spent} {ahead}");
-        }
-    }
-
+    /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
+    /// wraparound across >64 huge indexed-draw records (`count = None`), while
+    /// preserving `StartIndexLocation`, `BaseVertexLocation`,
+    /// `StartInstanceLocation`, and custom stride padding, and leaving
+    /// `src_args` untouched.
     /// A window of mesh records clamped ahead: the filled ones come out as
     /// they are and are charged, the slots of all ones come out empty and
     /// charge nothing; clamped as single records the same slots are clamped
     /// to the most and spend the budget.
-    #[test]
-    fn gathered_records_must_fit_the_clamp() {
-        // a mesh record 12 bytes wide at a 4-byte offset of a buffer on a 4-byte address
-        assert_eq!(gatherable(0x1000, 0x6d71550, (10, 12)), Some(0x6d71550));
-        assert_eq!(gatherable(0x1000, 0, (1, 20)), Some(0));
-        // not on four bytes, too narrow, too wide, an unknown kind, past 4 GiB
-        assert_eq!(gatherable(0x1000, 0x6d71552, (10, 12)), None);
-        assert_eq!(gatherable(0x1002, 0x40, (10, 12)), None);
-        assert_eq!(gatherable(0x1000, 0x40, (10, 8)), None);
-        assert_eq!(gatherable(0x1000, 0x40, (10, GATHER_STRIDE + 4)), None);
-        assert_eq!(gatherable(0x1000, 0x40, (7, 12)), None);
-        assert_eq!(gatherable(0x1000, 1 << 32, (10, 12)), None);
-        assert_eq!(gatherable(0x1000, u64::from(u32::MAX) - 3, (10, 12)), None);
-    }
-
-    #[test]
-    fn warp_gathered_records_come_out_as_if_clamped_one_by_one() {
-        let Some(mut warp) = WarpHarness::new() else {
-            return;
-        };
-        const KIND_MESH: u32 = 10;
-        const STRIDE: u32 = 12;
-        // Records scattered through a buffer as the title keeps them: 16 to
-        // thousands of bytes apart, not in order, one of them twice over
-        // the budget's most (65,535 groups), one of all ones (garbage).
-        let records: [(u32, [u32; 3]); 7] = [
-            (0x3350, [5, 1, 1]),
-            (0x0040, [519, 1, 1]),
-            (0x0050, [0, 1, 1]),
-            (0x7ff0, [70000, 1, 1]),
-            (0x1230, [u32::MAX, u32::MAX, u32::MAX]),
-            (0x0010, [9, 7, 3]),
-            (0x2000, [1, 0, 0]),
-        ];
-        let total = 0x8000usize;
-        let mut src = vec![0x5Au8; total];
-        for (at, words) in records {
-            for (w, word) in words.into_iter().enumerate() {
-                let i = at as usize + w * 4;
-                src[i..i + 4].copy_from_slice(&word.to_le_bytes());
-            }
-        }
-        let slots = (GATHER_MOST * STRIDE) as u64;
-        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
-        let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(u64::from(GATHER_MOST) * 4);
-        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
-        let (readback_buf, readback_ptr, _) = warp.shared_buffer(slots);
-        let dst_buf = warp.default_uav(slots);
-        // SAFETY: mapped buffers of these sizes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
-            std::ptr::write_bytes(table_ptr, 0, GATHER_MOST as usize * 4);
-            for (i, (at, _)) in records.into_iter().enumerate() {
-                (table_ptr as *mut u32).add(i).write_volatile(at);
-            }
-            std::ptr::write_bytes(budget_ptr, 0, 256);
-            std::ptr::write_bytes(readback_ptr, 0xEE, slots as usize);
-        }
-        assert!(record_gather_as(
-            &warp.clamp,
-            &warp.list,
-            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
-            &src_buf,
-            table_gpu,
-            (KIND_MESH, STRIDE, records.len() as u32),
-        ));
-        // SAFETY: an open list; the scratch buffer, which the pass left
-        // readable as arguments, is copied for the check.
-        unsafe {
-            warp.list.ResourceBarrier(&[transition(
-                &dst_buf,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, slots);
-        }
-        warp.submit_and_wait();
-        // SAFETY: the work is done; mapped buffers.
-        let (spent, out) = unsafe {
-            (
-                (budget_ptr as *const u32).read_volatile(),
-                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), records.len() * 3).to_vec(),
-            )
-        };
-        // Slot i holds record i as the clamp leaves a mesh record clamped
-        // alone: the groups bounded to 65,535 and the other two to one.
-        let want: Vec<[u32; 3]> = records.iter().map(|(_, w)| [w[0].min(65535), w[1].min(1), w[2].min(1)]).collect();
-        for (i, want) in want.iter().enumerate() {
-            assert_eq!(&out[i * 3..i * 3 + 3], want, "slot {i} (the record at {:#x})", records[i].0);
-        }
-        let charged: u32 = want.iter().map(|w| w[0] * w[1] * w[2] * 128).sum();
-        assert_eq!(spent, charged, "each record charged once, as clamped alone");
-        // The source is read only.
-        // SAFETY: a mapped buffer.
-        assert_eq!(unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), total) }, &src[..]);
-    }
-
     #[test]
     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
         let Some(mut warp) = WarpHarness::new() else {
@@ -1928,23 +2368,16 @@ void main() {
                 assert_eq!(rec, [groups, u32::from(groups > 0).max(1).min(1), 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
             }
             let charged_filled = (5 + 519) * 128;
-            if ahead {
-                for i in filled.len()..RECORDS as usize {
-                    assert_eq!(out[i * 8..i * 8 + 3], [0, 0, 0], "unfilled slot {i} must come out empty");
-                    assert_eq!(out[i * 8 + 3], u32::MAX, "the words after the record are copied as they are");
-                }
-                assert_eq!(spent, charged_filled, "unfilled slots charge nothing");
-                assert_eq!(largest, 519, "and are not counted as asked for");
-            } else {
-                // Thirteen slots at 65,535 groups: sixteen would be all of it.
-                assert_eq!(spent, charged_filled + 13 * 65535 * 128, "clamped one by one, each slot is charged the most");
-                assert_eq!(largest, u32::MAX);
+            // As one window ahead of its draws and one by one alike.
+            for i in filled.len()..RECORDS as usize {
+                assert_eq!(out[i * 8..i * 8 + 3], [0, 0, 0], "unfilled slot {i} must come out empty");
+                assert_eq!(out[i * 8 + 3], u32::MAX, "the words after the record are copied as they are");
             }
+            assert_eq!(spent, charged_filled, "unfilled slots charge nothing");
+            assert_eq!(largest, 519, "and are not counted as asked for");
         }
     }
 
-    /// Saturates the budget across more than 64 huge indexed draws while
-    /// preserving the remaining draw arguments and custom stride padding.
     #[test]
     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
         let Some(mut warp) = WarpHarness::new() else {
@@ -1963,11 +2396,10 @@ void main() {
 
         let mut initial_src = vec![0u8; total_bytes];
         for i in 0..RECORDS as usize {
-            // The first record is no draw (2^24 indices): it runs empty
-            // and charges nothing.
             let words: [u32; 6] = [
-                if i == 0 { 1 << 24 } else { 1 << 22 }, // IndexCount
-                if i == 0 { 1 } else { u32::MAX }, // InstanceCount -> clamps to 16 (cost = 1 << 26)
+                // The last is no draw: empty, and free.
+                if i + 1 < RECORDS as usize { 1 << 22 } else { 1 << 23 }, // IndexCount
+                u32::MAX,                    // InstanceCount -> clamps to 16 (cost = 1 << 26)
                 1000 + i as u32,             // StartIndexLocation
                 (-200i32 + i as i32) as u32, // BaseVertexLocation
                 5000 + i as u32,             // StartInstanceLocation
@@ -2033,7 +2465,6 @@ void main() {
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
@@ -2147,9 +2578,35 @@ void main() {
     /// word record by record, which of them fitted was up to the GPU.)
     #[test]
     fn warp_a_group_charges_its_records_in_lane_order() {
-        let Some(mut warp) = WarpHarness::new() else {
+        let Some((left, out)) = four_records_of_a_group(true) else {
             return;
         };
+        assert_eq!(out[0..4], [100, 1, 7, 9], "the first record fits");
+        for i in 1..4 {
+            assert_eq!(out[i * 4..i * 4 + 4], [0, 0, 7, 9], "record {i} runs empty");
+        }
+        assert_eq!(left, 0, "the record that did not fit took the rest");
+    }
+
+    /// As above where a record that does not fit takes nothing
+    /// (`VICTORY_INDIRECT_REST=0`): those after it that fit run.
+    #[test]
+    fn warp_a_record_that_does_not_fit_may_take_nothing() {
+        let Some((left, out)) = four_records_of_a_group(false) else {
+            return;
+        };
+        for (i, count) in [100, 0, 50, 100].into_iter().enumerate() {
+            assert_eq!(out[i * 4..i * 4 + 4], [count, count.min(1), 7, 9], "record {i}");
+        }
+        assert_eq!(left, 50);
+    }
+
+    /// Draws of 100, 250, 50 and 100 with 300 left of the budget: what is
+    /// left then, and the records as clamped.
+    fn four_records_of_a_group(rest: bool) -> Option<(u32, Vec<u32>)> {
+        let mut warp = WarpHarness::new()?;
+        let source = SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
+        let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
         const KIND_DRAW: u32 = 0;
         const STRIDE: u32 = 16;
         const BUDGET_CAP: u32 = 1 << 27;
@@ -2173,7 +2630,7 @@ void main() {
             (budget_ptr as *mut u32).write_volatile(BUDGET_CAP - 300);
         }
         assert!(record_clamp_as(
-            &warp.clamp,
+            &clamp,
             &warp.list,
             (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
             budget_gpu,
@@ -2200,11 +2657,7 @@ void main() {
                     .to_vec(),
             )
         };
-        assert_eq!(out[0..4], [100, 1, 7, 9], "the first record fits");
-        for i in 1..counts.len() {
-            assert_eq!(out[i * 4..i * 4 + 4], [0, 0, 7, 9], "record {i} runs empty");
-        }
-        assert_eq!(spent, BUDGET_CAP, "the record that did not fit took the rest");
+        Some((BUDGET_CAP - spent, out))
     }
 
     /// The list's budget starts empty at each submission, wherever it
@@ -2307,65 +2760,6 @@ void main() {
         // SAFETY: the list has run; a mapped buffer.
         let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
         assert_eq!(hits, 1, "the budget starts empty at the next submission");
-    }
-
-    /// The window check: a record nothing wrote since its window clamped
-    /// it compares equal; one written on the card after the window's clamp
-    /// (an untracked writer) is found, and named as the window had it and
-    /// as it is now.
-    #[test]
-    fn host_list_window_check_finds_a_record_written_under_its_window() {
-        let Some(host) = super::host() else {
-            return;
-        };
-        let Ok(list) = host.new_list() else {
-            return;
-        };
-        let _ = host.log_messages();
-        const KIND_DISPATCH: u32 = 2;
-        const STEP: u32 = 32;
-        let records = [[3u32, 1, 1], [5, 1, 1], [7, 1, 1], [9, 1, 1]];
-        let total = records.len() * STEP as usize;
-        let (Some((src, src_ptr)), Some((patch, patch_ptr))) =
-            (host.shared_buffer(total as u64), host.shared_buffer(64))
-        else {
-            return;
-        };
-        // SAFETY: mapped buffers of these sizes; nothing runs yet.
-        unsafe {
-            std::ptr::write_bytes(src_ptr, 0, total);
-            for (i, words) in records.iter().enumerate() {
-                std::ptr::copy_nonoverlapping(
-                    words.as_ptr().cast::<u8>(),
-                    src_ptr.add(i * STEP as usize),
-                    12,
-                );
-            }
-            std::ptr::copy_nonoverlapping([11u32, 2, 1].as_ptr().cast::<u8>(), patch_ptr, 12);
-        }
-        let spec = (KIND_DISPATCH, STEP, records.len() as u32);
-        let scratch = bound_ahead(&list, (&src, 0), spec).unwrap();
-        // Record 0: nothing wrote it.
-        assert!(check_hit(&list, (&src, 0), (KIND_DISPATCH, STEP), &scratch, 0));
-        // Record 1 is written on the card after the window's clamp.
-        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        // SAFETY: an open list; `src` was read by the clamp (promoted to a
-        // shader read), `patch` is common; both live until the list has run.
-        unsafe {
-            list.list.ResourceBarrier(&[transition(&src, read, D3D12_RESOURCE_STATE_COPY_DEST)]);
-            list.list.CopyBufferRegion(&src, u64::from(STEP), &patch, 0, 12);
-            list.list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COPY_DEST, read)]);
-        }
-        let at = u64::from(STEP);
-        assert!(check_hit(&list, (&src, at), (KIND_DISPATCH, STEP), &scratch, at));
-        list.close();
-        assert_eq!(host.log_messages(), None, "the debug layer found an error");
-        host.execute(&[&list]);
-        let (checked, differed, window, fresh) = list.window_check().unwrap().take();
-        list.reset();
-        assert_eq!((checked, differed), (2, 1), "two checks, the written record differs");
-        assert_eq!(window[..3], [5, 1, 1], "as the window clamped it");
-        assert_eq!(fresh[..3], [11, 2, 1], "as it is now");
     }
 
     /// Records the dispatch records `groups` (three words each, `step`
@@ -2541,6 +2935,387 @@ void main() {
             // SAFETY: the list has run; a mapped buffer.
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
             assert_eq!(hits, expected, "every record of both windows runs once");
+        }
+    }
+
+    /// A command signature of one argument of `kind` on `device`.
+    fn one_argument(device: &ID3D12Device, kind: u32, stride: u32) -> ID3D12CommandSignature {
+        let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &arg,
+            NodeMask: 0,
+        };
+        let mut sig: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a valid single-argument command signature description.
+        unsafe {
+            device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig).unwrap();
+        }
+        sig.unwrap()
+    }
+
+    /// An AMD card runs every group of an indirect dispatch of more than
+    /// 65,535, each under its own number: the title's tile lists
+    /// ([`widest`]), clamped one by one and in a batch. Others are not asked.
+    #[test]
+    fn card_runs_wide_indirect_dispatches() {
+        const CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
+    uint was;
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedMax(4, group.x, was);
+    seen.InterlockedMax(8, thread.x, was);
+    seen.InterlockedAdd(16 + group.x * 4, 1, was);
+}
+"#;
+        let Some(mut gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        if !amd(&gpu.device) || widest(true) == 65_535 {
+            return;
+        }
+        let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
+        let pass = make_from(&gpu.device, batch::SOURCE).expect("the batched clamp must compile");
+        let sig = gpu.signature(2, 12);
+        for asked in [67_440u32, 115_200, 1 << 20, (1 << 20) + 1] {
+            let runs = if asked > 1 << 20 { 65_535 } else { asked };
+            for batched in [false, true] {
+                let (src, src_ptr, src_gpu) = gpu.shared_buffer(1024);
+                let (_budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
+                let (_table, table_ptr, table_gpu) = gpu.shared_buffer(batch::TABLE);
+                let size = 16 + (4 << 20) + 16;
+                let seen = gpu.default_uav(size);
+                let (back, back_ptr, _) = gpu.shared_buffer(size);
+                let dst = gpu.default_uav(64 << 10);
+                // SAFETY: mapped buffers, which nothing reads yet; an open
+                // list and live buffers.
+                unsafe {
+                    std::ptr::write_bytes(budget_ptr, 0, 256);
+                    for (w, word) in [asked, 1, 1].into_iter().enumerate() {
+                        src_ptr.cast::<u32>().add(w).write_volatile(word);
+                    }
+                    if batched {
+                        batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+                        assert_eq!(batch::Table::new(table_ptr, 0, [1, 0, 0, 0]).place(1, 0, 2), Some(0));
+                    } else {
+                        let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
+                        assert!(record_clamp_as(&gpu.clamp, &gpu.list, to, budget_gpu, (&src, 0), None, (2, 12, 1), false));
+                    }
+                    gpu.list.SetComputeRootSignature(&worker.root);
+                    gpu.list.SetPipelineState(&worker.pso);
+                    gpu.list.SetComputeRootUnorderedAccessView(0, seen.GetGPUVirtualAddress());
+                    gpu.list.ExecuteIndirect(&sig, 1, &dst, 0, None, 0);
+                    gpu.list.ResourceBarrier(&[uav_barrier()]);
+                    gpu.list.ResourceBarrier(&[transition(&seen, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    gpu.list.CopyBufferRegion(&back, 0, &seen, 0, size);
+                }
+                gpu.submit_and_wait();
+                // SAFETY: the list has run; mapped words.
+                let word = |i: usize| unsafe { back_ptr.cast::<u32>().add(i).read_volatile() };
+                assert_eq!([word(0), word(1), word(2)], [runs, runs - 1, runs - 1], "asked for {asked}, batched {batched}");
+                let wrong = (0..runs as usize).find(|&g| word(4 + g) != 1);
+                assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, asked for {asked}");
+            }
+        }
+    }
+
+    /// What a batch's table says of records added to it: one job per
+    /// record, charged for every execution that reads it, and none for what
+    /// the pass cannot read.
+    #[test]
+    fn batch_tables() {
+        use batch::{JOBS, SLOT, TABLE, TIMES, Table, job};
+        let mut memory = vec![0xffff_ffffu32; TABLE as usize / 4 + 1];
+        // SAFETY: the vector holds the table and outlives its use.
+        let mut t = unsafe { Table::new(memory.as_mut_ptr().cast(), 4096, [7, 9, 0, 0]) };
+        assert_eq!(t.place(7, 64, 10), Some(4096));
+        assert_eq!(t.place(9, 64, 10), Some(4096 + u64::from(SLOT)));
+        assert_eq!(t.place(7, 64, 2), Some(4096 + 2 * u64::from(SLOT)), "another kind is another record");
+        // The same record again: the same place, charged twice.
+        assert_eq!(t.place(9, 64, 10), Some(4096 + u64::from(SLOT)));
+        assert_eq!(&memory[..4], [3, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff]);
+        assert_eq!(memory[4..8], [job(0, 10, 1), 64, 4096, 0]);
+        assert_eq!(memory[8..12], [job(1, 10, 2), 64, 4096 + SLOT, 0]);
+        assert_eq!(job(1, 10, 2), 1 | 10 << 4 | 3 << 8 | 2 << 16);
+        // Not a copy of the pass, not on 4 bytes, past 32 bits, not a kind.
+        for (id, offset, kind) in [(8, 64, 10), (7, 66, 10), (7, 1 << 32, 10), (7, u64::from(u32::MAX) & !3, 10), (7, 64, 3)] {
+            assert_eq!(t.place(id, offset, kind), None);
+        }
+        // Read more often than one job may be charged for: another job.
+        for _ in 1..TIMES {
+            assert_eq!(t.place(7, 64, 10), Some(4096));
+        }
+        assert_eq!(t.place(7, 64, 10), Some(4096 + 3 * u64::from(SLOT)));
+        assert_eq!(t.place(7, 64, 10), Some(4096 + 3 * u64::from(SLOT)));
+        for i in 4..u64::from(JOBS) {
+            assert_eq!(t.place(7, 1024 + 16 * i, 0), Some(4096 + i * u64::from(SLOT)));
+        }
+        assert_eq!(t.place(7, 1024, 1), None, "full");
+        assert_eq!(t.place(7, 1024 + 16 * 5, 0), Some(4096 + 5 * u64::from(SLOT)));
+        assert_eq!((memory[0], memory[TABLE as usize / 4]), (JOBS, 0xffff_ffff));
+    }
+
+    /// A batch clamps records exactly as the clamp of one execution does, of
+    /// any kind, sensible or not; they are added to its table after the pass
+    /// was recorded; it charges each as often as it is read.
+    #[test]
+    fn warp_batch_clamps_as_the_clamp_of_one_does() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        let kinds = [0u32, 1, 2, 10];
+        let values = [0u32, 1, 3, 100, 65_535, 65_536, 1 << 20, (1 << 23) - 1, 1 << 23, 1 << 24, (1 << 26) + 1, u32::MAX];
+        // Every kind with many records, in two sources.
+        let mut records: Vec<(u32, [u32; 5])> = Vec::new();
+        for kind in kinds {
+            for (i, a) in values.into_iter().enumerate() {
+                for (k, b) in values.into_iter().enumerate() {
+                    records.push((kind, [a, b, values[(i * 3 + k) % 4], 77, 0xABCD]));
+                }
+            }
+        }
+        // In passes of so few that the budget holds whatever one asks for,
+        // and one pass of them all, which it does not.
+        let (src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
+        let (_other, other_ptr, other_gpu) = warp.shared_buffer(64 << 10);
+        for (i, (_, words)) in records.iter().enumerate() {
+            for (w, word) in words.iter().enumerate() {
+                // SAFETY: 400 records of 32 bytes in 64 KiB.
+                unsafe {
+                    src_ptr.cast::<u32>().add(i * 8 + w).write_volatile(*word);
+                    other_ptr.cast::<u32>().add(i * 8 + w).write_volatile(*word);
+                }
+            }
+        }
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (back, back_ptr, _) = warp.shared_buffer(64 << 10);
+        let dst = warp.default_uav(64 << 10);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        for (i, (kind, _)) in records.iter().enumerate().step_by(3) {
+            let offset = i as u64 * 32;
+            let words = batch::words(*kind).unwrap();
+            let stride = words * 4;
+            let read = |p: *mut u8| -> Vec<u32> {
+                // SAFETY: the mapping holds more.
+                (0..words as usize).map(|w| unsafe { p.cast::<u32>().add(w).read_volatile() }).collect()
+            };
+            let mut seen = Vec::new();
+            for batched in [false, true] {
+                // SAFETY: mapped buffers; nothing runs.
+                unsafe { std::ptr::write_bytes(budget_ptr, 0, 256) };
+                if batched {
+                    batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu, other_gpu, src_gpu, src_gpu], table_gpu);
+                    // SAFETY: the mapped table; the list has not run.
+                    let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 2, 0, 0]) };
+                    assert_eq!(table.place(1 + i as u64 % 2, offset, *kind), Some(0));
+                } else {
+                    assert!(record_clamp_as(
+                        &warp.clamp,
+                        &warp.list,
+                        (&dst, D3D12_RESOURCE_STATE_COMMON),
+                        budget_gpu,
+                        (&src, offset),
+                        None,
+                        (*kind, stride, 1),
+                        false,
+                    ));
+                }
+                // SAFETY: an open list; the records are readable as arguments.
+                unsafe {
+                    warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    warp.list.CopyBufferRegion(&back, 0, &dst, 0, u64::from(stride));
+                    warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                }
+                warp.submit_and_wait();
+                // SAFETY: the list has run; mapped words.
+                let budget: Vec<u32> = (0..3).map(|k| unsafe { budget_ptr.cast::<u32>().add(k).read_volatile() }).collect();
+                seen.push((read(back_ptr), budget));
+            }
+            // (A mesh record that asks for nothing notes nothing.)
+            assert_eq!(seen[0], seen[1], "record {i} of kind {kind}: {:?}", records[i].1);
+        }
+    }
+
+    /// Records past the list's budget come out empty, and one read by many
+    /// executions is charged for each.
+    #[test]
+    fn warp_batch_charges_every_execution() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        const BUDGET: u32 = 1 << 27;
+        // 2^26 vertices each, as much as a draw is let run: two fill it.
+        for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
+            let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
+            let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (back, back_ptr, _) = warp.shared_buffer(1024);
+            let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+            let dst = warp.default_uav(64 << 10);
+            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+            // SAFETY: mapped buffers, which the list has not read yet.
+            let mut table = unsafe {
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                for r in 0..records {
+                    for (w, word) in [1u32 << 22, 16, 5, 6].into_iter().enumerate() {
+                        src_ptr.cast::<u32>().add(r as usize * 4 + w).write_volatile(word);
+                    }
+                }
+                batch::Table::new(table_ptr, 0, [1, 0, 0, 0])
+            };
+            for _ in 0..times {
+                for r in 0..records {
+                    assert_eq!(table.place(1, r * 16, 0), Some(r * u64::from(batch::SLOT)));
+                }
+            }
+            // SAFETY: an open list; the records are readable as arguments.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                warp.list.CopyBufferRegion(&back, 0, &dst, 0, 256);
+            }
+            warp.submit_and_wait();
+            // SAFETY: the list has run; mapped words.
+            let (spent, out): (u32, Vec<u32>) = unsafe {
+                (
+                    budget_ptr.cast::<u32>().read_volatile(),
+                    (0..records as usize).map(|r| back_ptr.cast::<u32>().add(r * batch::SLOT as usize / 4).read_volatile()).collect(),
+                )
+            };
+            assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
+            assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
+            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+        }
+    }
+
+    /// Two batches through a host list, twice (the second recording finds
+    /// the scratch buffer as the first one's end left it): executions with
+    /// nothing between them read what they asked for, of two source buffers,
+    /// the second batch while the first one's places are still read. With
+    /// the debug layer on no barrier names a state the buffer is not in.
+    #[test]
+    fn host_list_batches() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let signature = one_argument(&host.device, 2, 12);
+        let mut sources = Vec::new();
+        for first in [1u32, 100] {
+            let Some((buffer, ptr)) = host.shared_buffer(1024) else {
+                return;
+            };
+            for i in 0..16u32 {
+                for (w, word) in [first + i, 1, 1].into_iter().enumerate() {
+                    // SAFETY: inside the mapping.
+                    unsafe { ptr.cast::<u32>().add(i as usize * 8 + w).write_volatile(word) };
+                }
+            }
+            sources.push(buffer);
+        }
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        for _ in 0..2 {
+            // SAFETY: the mapping holds 256 bytes; nothing runs.
+            unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+            let mut expected = 0;
+            // More batches than one scratch buffer holds.
+            for k in 0..12u32 {
+                let (mut table, scratch) =
+                    open_batch(&list, (1, &sources[0]), &[(1, sources[0].clone()), (2, sources[1].clone())]).unwrap();
+                // SAFETY: an open list; the worker's root signature and
+                // pipeline; buffers the test holds until the list has run.
+                unsafe {
+                    list.list.SetComputeRootSignature(&worker.root);
+                    list.list.SetPipelineState(&worker.pso);
+                    list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                }
+                for (id, record) in [(1u64, 3 + k % 4), (2, 5), (1, 0), (2, 5)] {
+                    let at = table.place(id, u64::from(record) * 32, 2).unwrap();
+                    // SAFETY: as above.
+                    unsafe { list.list.ExecuteIndirect(&signature, 1, &scratch, at, None, 0) };
+                    expected += record + if id == 1 { 1 } else { 100 };
+                }
+            }
+            list.close();
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the list has run; a mapped buffer.
+            let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+            assert_eq!(hits, expected, "every execution runs what it asked for");
+        }
+    }
+
+    /// What clamps of a frame cost on the card one by one and in batches
+    /// (ignored: a measurement): 2,355 executions of an empty dispatch, in
+    /// 49 lists' worth of runs, as in the captured frame.
+    #[test]
+    #[ignore]
+    fn batch_costs() {
+        let Some(mut gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        const EXECUTIONS: u32 = 2355;
+        let pass = make_from(&gpu.device, batch::SOURCE).expect("the batched clamp must compile");
+        let sig = gpu.signature(2, 12);
+        let groups: Vec<u32> = vec![1; 2048];
+        let src = dispatch_records(&gpu, &groups, 32);
+        // SAFETY: a live buffer.
+        let src_gpu = unsafe { src.GetGPUVirtualAddress() };
+        let budget = gpu.default_uav(256);
+        let hits = gpu.default_uav(256);
+        // SAFETY: live buffers.
+        let (budget_gpu, hits_gpu) = unsafe { (budget.GetGPUVirtualAddress(), hits.GetGPUVirtualAddress()) };
+        let (_tables, tables_ptr, tables_gpu) = gpu.shared_buffer(batch::TABLE * 2400);
+        let dst = gpu.default_uav(4 << 20);
+        for run in [0u32, 2355 / 49, 5, 1] {
+            let mut best = f64::MAX;
+            for _ in 0..6 {
+                let mut state = D3D12_RESOURCE_STATE_COMMON;
+                let mut table = batch::Table::default();
+                for i in 0..EXECUTIONS {
+                    if run == 0 {
+                        assert!(record_clamp_as(&gpu.clamp, &gpu.list, (&dst, state), budget_gpu, (&src, u64::from(i % 2048) * 32), None, (2, 12, 1), false));
+                    } else if i % run == 0 {
+                        let k = u64::from(i / run) * batch::TABLE;
+                        batch::record(&pass, &gpu.list, (&dst, state), budget_gpu, [src_gpu; 4], tables_gpu + k);
+                        // SAFETY: the mapped table; the list has not run.
+                        table = unsafe { batch::Table::new(tables_ptr.add(k as usize), 0, [1, 0, 0, 0]) };
+                    }
+                    state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                    let at = if run == 0 { 0 } else { table.place(1, u64::from(i % 2048) * 32, 2).unwrap() };
+                    // SAFETY: an open list; live buffers.
+                    unsafe {
+                        if run == 0 || i % run == 0 {
+                            gpu.list.SetComputeRootSignature(&gpu.worker.root);
+                            gpu.list.SetPipelineState(&gpu.worker.pso);
+                            gpu.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                        }
+                        gpu.list.ExecuteIndirect(&sig, 1, &dst, at, None, 0);
+                    }
+                }
+                let t = std::time::Instant::now();
+                gpu.submit_and_wait();
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let what = if run == 0 { "each clamped on its own".to_owned() } else { format!("a batch every {run}") };
+            println!("{EXECUTIONS} indirect dispatches, {what}: {best:.2} ms");
         }
     }
 }

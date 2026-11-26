@@ -507,9 +507,6 @@ struct Lanes<'a> {
     /// Phi ids whose joins depend on EXEC or VALU results (including along
     /// back edges), carried across resets so their joins stay in `masks`.
     derived_phis: HashSet<Value>,
-    /// Non-EXEC phi ids that mix a mask with an opaque scalar value (e.g., a
-    /// register reused for both a mask and a loaded number).
-    opaque_phis: HashSet<Value>,
     b: Bools,
     /// Masks derived from EXEC and VALU results.
     masks: Map<Key, Bool>,
@@ -606,7 +603,6 @@ impl<'a> Lanes<'a> {
             phis,
             unresolved: HashSet::new(),
             derived_phis: HashSet::new(),
-            opaque_phis: HashSet::new(),
             b: Bools::new(),
             masks: Map::default(),
             other: Map::default(),
@@ -638,7 +634,6 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
-        self.opaque_phis.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -797,6 +792,9 @@ impl<'a> Lanes<'a> {
             .iter()
             .enumerate()
             .map(|(n, block)| {
+                // Reachability is fixed within the block. Vector instructions
+                // with the same EXEC therefore need the same guard.
+                let mut last_guard = None;
                 block
                     .insts
                     .iter()
@@ -806,8 +804,16 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
-                        (&Some(e), _) if b.implies(cond[n], e) => None,
-                        (&Some(e), _) => Some(b.given(e, cond[n])),
+                        (&Some(e), _) => {
+                            if let Some((prev, guard)) = last_guard
+                                && prev == e
+                            {
+                                return guard;
+                            }
+                            let guard = (!b.implies(cond[n], e)).then(|| b.given(e, cond[n]));
+                            last_guard = Some((e, guard));
+                            guard
+                        }
                     })
                     .collect()
             })
@@ -902,17 +908,6 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
-        // A scalar pair can be parked in two VGPR lanes and restored one
-        // dword at a time. The spill pass turns these into scalar moves.
-        // Recover the original lane predicate only when the two words
-        // still come from the same known mask, in their original order.
-        if self.p.wave64 {
-            let source = (self.move_source(k.0), self.move_source(k.1));
-            if source != k && let Some(&m) = self.masks.get(&source) {
-                self.masks.insert(k, m);
-                return (m, true);
-            }
-        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
@@ -955,20 +950,6 @@ impl<'a> Lanes<'a> {
         (m, derived)
     }
 
-    fn move_source(&self, mut value: Value) -> Value {
-        while let Some(&(b, i)) = self.defs.get(&value) {
-            let inst = &self.p.blocks[b].insts[i];
-            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
-                break;
-            };
-            if inst.name() != "s_mov_b32" {
-                break;
-            }
-            value = *source;
-        }
-        value
-    }
-
     /// A mask joined by phis at a block entry, and whether a mask coming in
     /// on a forward edge derives from EXEC or a VALU result. Where every
     /// lane arriving so far has the incoming mask set (or clear), the join
@@ -990,7 +971,6 @@ impl<'a> Lanes<'a> {
             .collect();
         let id = lo.map_or(k.1, |_| k.0);
         let mut derived = self.derived_phis.contains(&id);
-        let mut has_opaque = false;
         // (edge condition, mask) per forward edge; back edges come later.
         let mut forward = Vec::new();
         for (n, &a) in args.iter().enumerate() {
@@ -998,17 +978,11 @@ impl<'a> Lanes<'a> {
             if self.index[q] < self.index[block] {
                 let (m, d) = self.mask(a);
                 derived |= d;
-                has_opaque |= self.opaque_phis.contains(&a.0)
-                    || self.opaque_phis.contains(&a.1)
-                    || (!d && self.b.support(m).iter().any(|x| matches!(x, Atom::Opaque(_))));
                 let e = self.edge(self.first[q], q, taken);
                 forward.push((e, m));
             } else {
                 self.seen.push(a);
             }
-        }
-        if derived && has_opaque && !self.active.contains(&id) {
-            self.opaque_phis.insert(id);
         }
         if forward.len() == args.len()
             && let Some(&(_, m)) = forward.first()
@@ -1228,10 +1202,7 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        let is_mask = self.masks.contains_key(&k) || phi && self.mask(k).1;
-                        if is_mask && !self.opaque_phis.contains(&k.0) && !self.opaque_phis.contains(&k.1) {
-                            takes_mask = true;
-                        }
+                        takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
                     }
                 }
                 let touches_exec =
@@ -1618,6 +1589,37 @@ mod tests {
     }
 
     #[test]
+    fn guards_follow_exec_and_block_reachability() {
+        let p = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xBF88_0005, // s_cbranch_execz -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7DA4_0880, // v_cmpx_eq_u32 exec, 0, v4
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let lane = |block: usize, i: usize| {
+            Atom::Lane(p.blocks[block].insts[i].write(Reg::S(EXEC)).unwrap())
+        };
+        let a = s.guards[0][1].unwrap();
+        let b = s.guards[1][2].unwrap();
+        assert_eq!(s.bools.node(a), Some((lane(0, 0), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[0], [None, Some(a), Some(a), None]);
+        // The fallthrough already implies the first compare. Only the second
+        // compare needs testing, and the scalar move never needs a guard.
+        assert_eq!(s.bools.node(b), Some((lane(1, 1), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[1], [None, None, Some(b), None, Some(b)]);
+    }
+
+    #[test]
     fn divergent_loop_exits_per_lane() {
         let p = build(
             &[
@@ -1727,32 +1729,6 @@ mod tests {
                 Some((Atom::Lane(lo), Bool::FALSE, Bool::TRUE)),
                 "{reader:#x}: vcc_hi was zeroed after the compare"
             );
-        }
-    }
-
-    #[test]
-    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
-        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
-            let p = build(
-                &[
-                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
-                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
-                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
-                    0xBF85_0004, // s_cbranch_scc1 -> join at 32
-                    0xBE82_036A, // s_mov_b32 s2, vcc_lo
-                    high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
-                    0xBE84_0302, // s_mov_b32 s4, s2
-                    0xBE85_0303, // s_mov_b32 s5, s3
-                    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-                    0x7E02_0280, // v_mov_b32 v1, 0
-                    S_ENDPGM,
-                ],
-                true,
-            );
-            let s = structure(&p).unwrap();
-            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
-            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
-            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
         }
     }
 
@@ -1910,38 +1886,5 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
-    }
-
-    #[test]
-    fn mixed_mask_and_opaque_phi_does_not_taint_scalar_bit_ops() {
-        let p = build(
-            &[
-                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
-                0x8702_7E6A, // s_and_b32 s2, vcc_lo, exec_lo
-                0xBF06_8000, // s_cmp_eq_u32 s0, 0
-                0xBF85_0003, // s_cbranch_scc1 merge
-                0xF400_0082,
-                0xFA00_0000, // s_load_dword s2, s[4:5], null
-                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-                // merge:
-                0x8703_FF02,
-                0x001F_FFFF, // s_and_b32 s3, s2, 0x001fffff
-                0x8806_0301, // s_or_b32 s6, s1, s3
-                0x7D8A_0006, // v_cmp_ne_u32 vcc_lo, s6, v0
-                S_ENDPGM,
-            ],
-            false,
-        );
-        let s = structure(&p).unwrap();
-        let def = |reg: u8| {
-            p.blocks
-                .iter()
-                .flat_map(|b| &b.insts)
-                .filter_map(|i| i.write(Reg::S(reg)))
-                .last()
-                .expect("write")
-        };
-        assert!(!s.masks.contains_key(&def(3)), "s3 should stay scalar data");
-        assert!(!s.masks.contains_key(&def(6)), "s6 should stay scalar data");
     }
 }

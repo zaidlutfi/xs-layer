@@ -10,6 +10,7 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 /// `GetModuleHandle(NULL)` and friends to return this, not our own exe.
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
+    crate::image_watch::start(base);
 }
 
 pub fn main_image() -> Option<usize> {
@@ -53,6 +54,18 @@ pub fn image_named(file: &str) -> Option<usize> {
         .iter()
         .find(|(_, p)| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(file)))
         .map(|(b, _)| *b)
+}
+
+static TITLE_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The arguments the title's `main` gets (those after `--`). Set once, before
+/// the title starts; later calls are ignored.
+pub fn set_title_args(args: Vec<String>) {
+    let _ = TITLE_ARGS.set(args);
+}
+
+pub fn title_args() -> &'static [String] {
+    TITLE_ARGS.get().map_or(&[], Vec::as_slice)
 }
 
 /// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its
@@ -112,6 +125,32 @@ impl Title {
     }
 }
 
+/// The trimmed text of one element: comments inside it are skipped, not
+/// treated as the end of its value. A manifest generator can write
+/// `<TitleId><!-- generated -->639AA8DD</TitleId>`, which must still give
+/// the title's id rather than an empty field.
+fn field_text(rest: &str) -> String {
+    let mut out = String::new();
+    let mut rest = rest;
+    loop {
+        let Some(open) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        if rest[open..].starts_with("<!--") {
+            let Some(end) = rest[open..].find("-->") else {
+                break;
+            };
+            rest = &rest[open + end + 3..];
+        } else {
+            // A child element, a closing tag or anything else ends the text.
+            break;
+        }
+    }
+    out.trim().to_owned()
+}
+
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
 /// and its trimmed text up to the first child, the predefined entities
 /// decoded; comments, CDATA sections, declarations and attributes are
@@ -127,7 +166,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
         } else if rest.starts_with("<![CDATA[") {
             rest.find("]]>").map(|e| e + 3)
         } else {
-            rest.find('>').map(|e| e + 1)
+            tag_end(rest)
         };
         let Some(end) = end else { break };
         let tag = &rest[1..end - 1];
@@ -148,16 +187,31 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
+        let body = field_text(rest);
         let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
             .iter()
-            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+            .fold(body, |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
         }
     }
     out
+}
+
+/// Where the tag that starts `text` ends, past its `>`; a `>` in a quoted
+/// attribute value is part of the value (XML allows it there unescaped).
+fn tag_end(text: &str) -> Option<usize> {
+    let mut quote = None;
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(open), _) if c == open => quote = None,
+            (None, '>') => return Some(at + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
@@ -214,11 +268,39 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+    ahead_of_other_programs();
+}
+
+/// The title's streaming thread runs below normal priority (on the console
+/// nobody else wants its core) and does all of the title's loading: a
+/// program that keeps the processors busy at normal priority (a build, a
+/// virus scan) starved it, loading took 40 to 60 s instead of 28 to 33, and
+/// the opening ran without the models that were to be there (runs cpu-1,
+/// play-1125-0203). The process runs above normal, as long as it runs.
+/// `VICTORY_PROCESS_PRIORITY=normal`: as it was started.
+#[cfg(windows)]
+fn ahead_of_other_programs() {
+    use windows_sys::Win32::System::Threading::{ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
+    if std::env::var_os("VICTORY_PROCESS_PRIORITY").is_some_and(|v| v == "normal" || v == "0") {
+        return;
+    }
+    // SAFETY: a plain process setting.
+    let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
+    tracing::info!(set, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quoted_angle_bracket_does_not_end_its_tag() {
+        let text = "<Game><ShellVisuals DefaultDisplayName=\"A > B\" Description='x>y'/>\
+                    <TitleId>639AA8DD</TitleId>\
+                    <PersistentLocalStorage><SizeMB>64</SizeMB></PersistentLocalStorage></Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 64 << 20));
+    }
 
     #[test]
     fn reads_title_id_store_id_and_storage_quota() {
@@ -232,5 +314,18 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn inline_comments_do_not_truncate_a_field() {
+        let text = "<Game>\
+            <TitleId><!-- generated -->639AA8DD</TitleId>\
+            <StoreId>9&amp;<!-- keep -->C</StoreId>\
+            <PersistentLocalStorage><SizeMB><!-- n -->1024</SizeMB></PersistentLocalStorage>\
+            </Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!(t.id, 0x639A_A8DD);
+        assert_eq!(t.store_id, "9&C");
+        assert_eq!(t.storage_bytes, 1024 << 20);
     }
 }

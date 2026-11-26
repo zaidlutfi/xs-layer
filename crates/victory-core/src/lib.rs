@@ -6,8 +6,6 @@
 //! * [`logging`]: one tracing setup for all binaries.
 
 pub mod config;
-#[cfg(windows)]
-pub mod fence_watch;
 pub mod logging;
 pub mod policy;
 
