@@ -5,8 +5,11 @@
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [switch]$SkipWarm,
-    [string]$Exe = "$PSScriptRoot\victory.exe"
+    [string]$Exe
 )
+# The folder is not known yet where a parameter's default is worked out (Windows PowerShell 5.1,
+# with a mandatory parameter above): the default used to come out as "\victory.exe".
+if (-not $Exe) { $Exe = Join-Path $PSScriptRoot 'victory.exe' }
 if (-not (Test-Path $Game)) { Write-Error "Game not found: $Game"; exit 1 }
 if (-not (Test-Path $Exe)) { Write-Error "victory.exe not found next to run.ps1 (or pass -Exe)"; exit 1 }
 
