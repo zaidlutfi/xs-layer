@@ -433,7 +433,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     asked: read_blocked(written, *src, *len),
                     to: to.is_some(),
                 },
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     let (at, len) = staging.memory();
                     Does::Read {
                         from: at,

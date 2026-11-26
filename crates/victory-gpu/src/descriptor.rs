@@ -168,6 +168,99 @@ fn sync_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_SYNC_HEAPS_VQ=1`: [`sync_heaps`] finds the readable pages by a walk
+/// of the regions (`VirtualQuery`) and reads the readable ones grouped. Default
+/// off: one kernel read a page, as before.
+#[cfg(windows)]
+fn vq_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_HEAPS_VQ").is_some_and(|v| v == "1"))
+}
+
+/// The 64 KiB pieces of `[from, to)` (as [`sync_heaps`] cuts them) that a walk
+/// of the regions says are readable whole, appended to `out` in order. A
+/// region is readable when it is committed and neither guarded nor no-access;
+/// a piece that a region boundary cuts is not whole in one, and a read of it
+/// would fail, so it is left out.
+#[cfg(windows)]
+fn readable_pieces(from: usize, to: usize, out: &mut Vec<(usize, usize)>) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let page = crate::watch::PAGE;
+    // The readable stretches of `[from, to)`, neighbours across regions merged.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut at = from & !(page - 1);
+    while at < to {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, std::mem::size_of_val(&info)) } == 0 {
+            break;
+        }
+        let next = (info.BaseAddress as usize + info.RegionSize).max(at + 1).min(to);
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+            let (a, b) = (at.max(from), next);
+            if a < b {
+                match runs.last_mut() {
+                    Some(run) if run.1 == a => run.1 = b,
+                    _ => runs.push((a, b)),
+                }
+            }
+        }
+        at = next;
+    }
+    for (a, b) in runs {
+        // The first piece that starts inside the run. `from` starts a piece;
+        // any other run start is cut from the piece before it.
+        let mut s = if a == from { from } else { a.div_ceil(page) * page };
+        while s < b {
+            let e = ((s / page + 1) * page).min(to);
+            if e > b {
+                break;
+            }
+            out.push((s, e));
+            s = e;
+        }
+    }
+}
+
+/// Reads one chunk of [`sync_heaps`]' pieces. Returns each piece that was read
+/// as `(from, to, lo, hi)`, its bytes at `buf[lo..hi]`; a piece whose read
+/// failed is left out. Without `VICTORY_SYNC_HEAPS_VQ`, each piece is one read,
+/// as before. With it, pieces that run on from one another (all walked
+/// readable) are read in one go; if that fails they are read one piece at a
+/// time, so a page the title unmaps meanwhile costs only itself.
+#[cfg(windows)]
+fn read_parts(chunk: &[(usize, usize)], buf: &mut Vec<u8>) -> Vec<(usize, usize, usize, usize)> {
+    let grouped = vq_on();
+    let mut out = Vec::with_capacity(chunk.len());
+    let mut i = 0;
+    while i < chunk.len() {
+        let mut j = i + 1;
+        if grouped {
+            while j < chunk.len() && chunk[j].0 == chunk[j - 1].1 {
+                j += 1;
+            }
+        }
+        let (from, to) = (chunk[i].0, chunk[j - 1].1);
+        let lo = buf.len();
+        buf.resize(lo + (to - from), 0);
+        if crate::host::read_into(from as *const u8, &mut buf[lo..]) {
+            out.extend(chunk[i..j].iter().map(|&(f, t)| (f, t, lo + (f - from), lo + (t - from))));
+        } else if j - i > 1 {
+            for &(f, t) in &chunk[i..j] {
+                let at = lo + (f - from);
+                if crate::host::read_into(f as *const u8, &mut buf[at..at + (t - f)]) {
+                    out.push((f, t, at, at + (t - f)));
+                }
+            }
+        }
+        i = j;
+    }
+    out
+}
+
 /// Whether a submission's [`sync_heaps`] is done by a thread of its own
 /// beside the rest of the preparing (`VICTORY_HEAP_SYNC_ASIDE=0`: in front of
 /// it, as before).
@@ -344,6 +437,10 @@ pub(crate) fn sync_heaps() {
         spent[0] += since(began);
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
+            if vq_on() {
+                readable_pieces(range_from, range_end, &mut parts);
+                continue;
+            }
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
@@ -361,14 +458,12 @@ pub(crate) fn sync_heaps() {
             let mut out = SyncPart::default();
             let mut page_bytes: Vec<u8> = Vec::new();
             let mut changed: Vec<u32> = Vec::new();
-            for &(from, to) in parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
+            let chunk = parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default();
+            for (from, to, lo, hi) in read_parts(chunk, &mut page_bytes) {
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if !crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    continue;
-                }
+                let page_bytes = &page_bytes[lo..hi];
                 out.pages += 1;
                 out.views += u64::from(crate::watch::guarded(from, to));
                 out.bytes += (to - from) as u64;
@@ -1558,6 +1653,55 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    /// The heap sync's readable pieces: the region walk (`sync_heaps` under
+    /// `VICTORY_SYNC_HEAPS_VQ`) finds the same 64 KiB pieces as a read of each
+    /// finds. A guarded page and a page given back inside another piece are
+    /// out of both. The walk runs first: a read of a guarded page may take the
+    /// guard.
+    #[cfg(windows)]
+    #[test]
+    fn a_region_walk_finds_the_pieces_a_read_finds() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        let page = crate::watch::PAGE;
+        let mb = 256;
+        // SAFETY: a fresh allocation, freed by the test.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), mb << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert!(base != 0);
+        let mut ignored = 0;
+        // SAFETY: our allocation: a guarded page in the middle, and one 4 KiB
+        // page given back inside piece 3 (so that piece is not whole).
+        unsafe {
+            VirtualProtect((base + (mb << 19)) as *const _, page, PAGE_GUARD | PAGE_READWRITE, &mut ignored);
+            VirtualFree((base + 3 * page + 8192) as *mut _, 4096, MEM_DECOMMIT);
+        }
+        let (from, to) = (base, base + (mb << 20));
+        let t0 = std::time::Instant::now();
+        let mut walked: Vec<(usize, usize)> = Vec::new();
+        super::readable_pieces(from, to, &mut walked);
+        let t_walk = t0.elapsed();
+        // Baseline: one read of each piece.
+        let t0 = std::time::Instant::now();
+        let mut read: Vec<(usize, usize)> = Vec::new();
+        let mut buf = vec![0u8; page];
+        let mut at = from;
+        while at < to {
+            let end = (at + page).min(to);
+            if crate::host::read_into(at as *const u8, &mut buf[..end - at]) {
+                read.push((at, end));
+            }
+            at = end;
+        }
+        let t_read = t0.elapsed();
+        assert_eq!(walked, read, "the same pieces are readable");
+        assert_eq!(walked.len(), mb * 16 - 2, "the guarded piece and the given-back piece are out");
+        eprintln!("{mb} MB, {} pieces: a read each {t_read:?}, the region walk {t_walk:?}", read.len());
+        // SAFETY: freeing our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 
     #[cfg(windows)]
